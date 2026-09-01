@@ -1,4 +1,4 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{FontId, GlyphId, Pixels, Point, SharedString, Size, TextSystem, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -12,7 +12,7 @@ use std::{
 use super::LineWrapper;
 
 /// A laid out and styled line of text
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct LineLayout {
     /// The font size for this line
     pub font_size: Pixels,
@@ -454,7 +454,7 @@ impl WrappedLineLayout {
 pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
-    platform_text_system: Arc<dyn PlatformTextSystem>,
+    text_system: Arc<TextSystem>,
 }
 
 #[derive(Default)]
@@ -485,11 +485,11 @@ pub(crate) struct LineLayoutIndex {
 }
 
 impl LineLayoutCache {
-    pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
+    pub fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
-            platform_text_system,
+            text_system,
         }
     }
 
@@ -667,13 +667,14 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
-
-            if let Some(force_width) = force_width {
+            let layout = self.text_system.layout_line_cached(&text, font_size, runs);
+            let layout = if let Some(force_width) = force_width {
+                let mut layout = (*layout).clone();
                 apply_force_width_to_layout(&mut layout, force_width);
-            }
+                Arc::new(layout)
+            } else {
+                layout
+            };
 
             let key = Arc::new(CacheKey {
                 text,
@@ -682,7 +683,6 @@ impl LineLayoutCache {
                 wrap_width: None,
                 force_width,
             });
-            let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
@@ -816,13 +816,14 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
-        let mut layout = self
-            .platform_text_system
-            .layout_line(&text, font_size, runs);
-
-        if let Some(force_width) = force_width {
+        let layout = self.text_system.layout_line_cached(&text, font_size, runs);
+        let layout = if let Some(force_width) = force_width {
+            let mut layout = (*layout).clone();
             apply_force_width_to_layout(&mut layout, force_width);
-        }
+            Arc::new(layout)
+        } else {
+            layout
+        };
 
         let key = Arc::new(HashedCacheKey {
             text_hash,
@@ -832,7 +833,6 @@ impl LineLayoutCache {
             wrap_width: None,
             force_width,
         });
-        let layout = Arc::new(layout);
         current_frame
             .lines_by_hash
             .insert(key.clone(), layout.clone());

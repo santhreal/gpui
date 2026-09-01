@@ -1280,7 +1280,7 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::{Context, ParentElement as _, Render, Styled as _, TestAppContext, div, px};
     #[test]
     fn test_into_element_for() {
         use crate::{ParentElement as _, SharedString, div};
@@ -1308,6 +1308,132 @@ mod tests {
         assert_ne!(
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
+        );
+    }
+
+    struct TruncatedRowsView {
+        rows: Vec<String>,
+    }
+
+    impl Render for TruncatedRowsView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .w(px(256.0))
+                .children(self.rows.iter().cloned().map(|row_text| {
+                    div().w_full().truncate().child(row_text)
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn test_40_rows_that_fit_shape_once_in_frame_1_and_zero_in_frame_2(cx: &mut TestAppContext) {
+        let text_system = cx.text_system().clone();
+        text_system.reset_shaping_calls();
+
+        let rows: Vec<String> = (0..40)
+            .map(|i| format!("Row {:02}: item text", i))
+            .collect();
+
+        let (view, cx) = cx.add_window_view(|_window, _cx| TruncatedRowsView {
+            rows: rows.clone(),
+        });
+
+        let frame_1_calls = text_system.shaping_calls();
+        assert_eq!(
+            frame_1_calls, 40,
+            "frame 1 must shape each distinct row exactly once"
+        );
+
+        text_system.reset_shaping_calls();
+        view.update(cx, |_view, cx| cx.notify());
+        cx.run_until_parked();
+
+        let frame_2_calls = text_system.shaping_calls();
+        assert_eq!(
+            frame_2_calls, 0,
+            "frame 2 with unchanged content must perform 0 shaping calls"
+        );
+    }
+
+    #[gpui::test]
+    fn test_a_row_whose_text_changes_between_frames_shapes_exactly_once_more(
+        cx: &mut TestAppContext,
+    ) {
+        let text_system = cx.text_system().clone();
+        text_system.reset_shaping_calls();
+
+        let rows: Vec<String> = (0..40)
+            .map(|i| format!("Row {:02}: item text", i))
+            .collect();
+
+        let (view, cx) = cx.add_window_view(|_window, _cx| TruncatedRowsView {
+            rows: rows.clone(),
+        });
+
+        assert_eq!(text_system.shaping_calls(), 40);
+
+        text_system.reset_shaping_calls();
+        view.update(cx, |view, cx| {
+            view.rows[5] = "Row 05: updated content".to_string();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let frame_2_calls = text_system.shaping_calls();
+        assert_eq!(
+            frame_2_calls, 1,
+            "frame 2 with one changed row must shape exactly once more"
+        );
+
+        text_system.reset_shaping_calls();
+        view.update(cx, |_view, cx| cx.notify());
+        cx.run_until_parked();
+
+        let frame_3_calls = text_system.shaping_calls();
+        assert_eq!(
+            frame_3_calls, 0,
+            "frame 3 with no changes must perform 0 shaping calls"
+        );
+    }
+
+    #[gpui::test]
+    fn test_advance_cache_cap_eviction_observable(cx: &mut TestAppContext) {
+        let text_system = cx.text_system().clone();
+        text_system.set_advance_cache_capacity(10);
+        text_system.reset_shaping_calls();
+
+        let rows: Vec<String> = (0..10)
+            .map(|i| format!("Row {:02}: item", i))
+            .collect();
+
+        let (view, cx) = cx.add_window_view(|_window, _cx| TruncatedRowsView {
+            rows: rows.clone(),
+        });
+
+        assert_eq!(text_system.shaping_calls(), 10);
+
+        // Shape 10 new distinct rows (items 10..20) to evict the first 10 items from the cache of capacity 10
+        text_system.reset_shaping_calls();
+        view.update(cx, |view, cx| {
+            view.rows = (10..20).map(|i| format!("Row {:02}: item", i)).collect();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(text_system.shaping_calls(), 10);
+
+        // Now bring back Row 00. Since it was evicted, it must trigger a new shaping call.
+        text_system.reset_shaping_calls();
+        view.update(cx, |view, cx| {
+            view.rows = vec!["Row 00: item".to_string()];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            text_system.shaping_calls(),
+            1,
+            "evicted row must shape again on cache miss"
         );
     }
 }

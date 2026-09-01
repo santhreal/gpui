@@ -1,9 +1,11 @@
+mod advance_cache;
 mod font_fallbacks;
 mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
 
+pub(crate) use advance_cache::*;
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
@@ -31,6 +33,8 @@ use std::{
     ops::{Deref, DerefMut, Range},
     sync::Arc,
 };
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// An opaque identifier for a specific font.
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
@@ -56,6 +60,9 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    advance_cache: Mutex<LruCache<AdvanceCacheKey, Arc<LineLayout>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) shaping_calls: AtomicUsize,
 }
 
 impl TextSystem {
@@ -81,7 +88,40 @@ impl TextSystem {
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
             ],
+            advance_cache: Mutex::new(LruCache::new(Self::DEFAULT_ADVANCE_CACHE_CAPACITY)),
+            #[cfg(any(test, feature = "test-support"))]
+            shaping_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Default maximum capacity of the persistent text advance cache.
+    pub const DEFAULT_ADVANCE_CACHE_CAPACITY: usize = 4096;
+
+    /// Sets the maximum capacity of the persistent text advance cache.
+    pub fn set_advance_cache_capacity(&self, capacity: usize) {
+        self.advance_cache.lock().set_capacity(capacity);
+    }
+
+    /// Returns the current number of cached entries in the persistent text advance cache.
+    pub fn advance_cache_len(&self) -> usize {
+        self.advance_cache.lock().len()
+    }
+
+    /// Clears the persistent text advance cache.
+    pub fn clear_advance_cache(&self) {
+        self.advance_cache.lock().clear();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Returns the number of times the underlying platform text system was invoked to shape a line.
+    pub fn shaping_calls(&self) -> usize {
+        self.shaping_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Resets the shaping call counter to zero.
+    pub fn reset_shaping_calls(&self) {
+        self.shaping_calls.store(0, Ordering::Relaxed);
     }
 
     /// Get a list of all available font names from the operating system.
@@ -224,16 +264,81 @@ impl TextSystem {
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
         let mut buffer = [0; 4];
         let buffer = ch.encode_utf8(&mut buffer);
-        self.platform_text_system
-            .layout_line(
-                buffer,
-                font_size,
-                &[FontRun {
-                    len: buffer.len(),
-                    font_id,
-                }],
-            )
-            .width
+        let runs = [FontRun {
+            len: buffer.len(),
+            font_id,
+        }];
+        self.layout_line_cached(buffer, font_size, &runs).width
+    }
+
+    /// Returns the shaped advance width of the given text for the given font and font size,
+    /// consulting the persistent advance cache.
+    pub fn advance_for_text(&self, text: &str, font: &Font, font_size: Pixels) -> Pixels {
+        let font_id = self.resolve_font(font);
+        self.advance_for_text_with_font_id(text, font_id, font_size)
+    }
+
+    /// Returns the shaped advance width of the given text for the given font id and font size,
+    /// consulting the persistent advance cache.
+    pub fn advance_for_text_with_font_id(
+        &self,
+        text: &str,
+        font_id: FontId,
+        font_size: Pixels,
+    ) -> Pixels {
+        let runs = [FontRun {
+            len: text.len(),
+            font_id,
+        }];
+        self.layout_line_cached(text, font_size, &runs).width
+    }
+
+    /// Returns the shaped advance width of the given text with the specified font runs and font size,
+    /// consulting the persistent advance cache.
+    pub fn advance_for_runs(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> Pixels {
+        self.layout_line_cached(text, font_size, runs).width
+    }
+
+    /// Layout a line of text, consulting the persistent advance cache.
+    ///
+    /// If the layout is already cached in the advance cache, it is returned without
+    /// invoking the underlying platform text system. On a cache miss, the line is shaped
+    /// by the platform, stored in the advance cache (evicting least recently used entries
+    /// if the cache capacity is exceeded), and returned.
+    pub fn layout_line_cached(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+    ) -> Arc<LineLayout> {
+        let key_ref = AdvanceCacheKeyRef {
+            text,
+            font_size,
+            runs,
+        };
+
+        {
+            let mut cache = self.advance_cache.lock();
+            if let Some(layout) = cache.get(&key_ref as &dyn AsAdvanceCacheKeyRef) {
+                return layout.clone();
+            }
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.shaping_calls.fetch_add(1, Ordering::Relaxed);
+
+        let mut layout = self.platform_text_system.layout_line(text, font_size, runs);
+        layout.font_size = font_size;
+        let layout = Arc::new(layout);
+
+        let key = AdvanceCacheKey {
+            text: SharedString::from(text),
+            font_size,
+            runs: SmallVec::from(runs),
+        };
+
+        self.advance_cache.lock().insert(key, layout.clone());
+        layout
     }
 
     /// Returns the width of an `em`.
@@ -387,7 +492,7 @@ impl WindowTextSystem {
     /// Create a new WindowTextSystem with the given TextSystem.
     pub fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
-            line_layout_cache: LineLayoutCache::new(text_system.platform_text_system.clone()),
+            line_layout_cache: LineLayoutCache::new(text_system.clone()),
             text_system,
         }
     }
