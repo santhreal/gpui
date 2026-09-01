@@ -326,6 +326,10 @@ pub struct Style {
 
     /// Declared transition parameters for animatable style properties
     pub transition: Option<StyleTransition>,
+
+    /// Explicit z-index within a layer / visual stacking context
+    pub z_index: Option<i32>,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -992,6 +996,8 @@ impl Default for Style {
             backdrop_saturation: None,
             backdrop_tint: None,
             transition: None,
+            z_index: None,
+            #[cfg(debug_assertions)]
             debug: false,
             #[cfg(debug_assertions)]
             debug_below: false,

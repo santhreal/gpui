@@ -4101,10 +4101,17 @@ impl Window {
         if !clipped_bounds.is_empty() {
             self.next_frame.scene.pop_layer();
         }
-
         result
     }
 
+    /// Sets an explicit z-index for primitives painted inside `f`.
+    pub fn with_z_index<R>(&mut self, z_index: i32, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.scene.push_z_index(z_index);
+        let result = f(self);
+        self.next_frame.scene.pop_z_index();
+        result
+    }
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.

@@ -2002,11 +2002,19 @@ impl Element for Div {
                         return;
                     }
 
-                    for child in &mut self.children {
-                        child.paint(window, cx);
+                    if let Some(z_index) = style.z_index {
+                        window.with_z_index(z_index, |window| {
+                            for child in &mut self.children {
+                                child.paint(window, cx);
+                            }
+                        });
+                    } else {
+                        for child in &mut self.children {
+                            child.paint(window, cx);
+                        }
                     }
                 },
-            )
+            );
         });
     }
 }

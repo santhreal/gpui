@@ -998,4 +998,10 @@ pub trait Styled: Sized {
         self.style().transition = Some(StyleTransition::spring(spring));
         self
     }
+
+    /// Sets explicit z-index within a layer / container.
+    fn z_index(mut self, z_index: impl Into<Option<i32>>) -> Self {
+        self.style().z_index = z_index.into();
+        self
+    }
 }
