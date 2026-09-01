@@ -23,6 +23,12 @@ x11 = ["gpui_linux/x11"]
 
 [dependencies]
 gpui.workspace = true
+log.workspace = true
+
+# The offscreen headless renderer lives in gpui_wgpu. macOS reaches its own
+# Metal one instead, so this is every other platform.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+gpui_wgpu.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_macos.workspace = true

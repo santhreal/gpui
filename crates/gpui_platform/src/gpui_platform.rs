@@ -81,6 +81,9 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 }
 
 /// Returns a new [`HeadlessRenderer`] for the current platform, if available.
+///
+/// The size is the initial offscreen target; a renderer that draws a different
+/// size resizes its drawable before the first frame.
 #[cfg(any(feature = "bench-support", feature = "test-support"))]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
     #[cfg(target_os = "macos")]
@@ -90,9 +93,27 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
         ))
     }
 
+    // Every platform that renders through wgpu reaches the offscreen path here.
+    // Without this arm the surfaceless renderer exists and nothing can build
+    // one, so a headless render on Linux returns no renderer and the frame is
+    // empty rather than failing.
     #[cfg(not(target_os = "macos"))]
     {
-        None
+        use gpui::{DevicePixels, Size};
+
+        // The offscreen target is resized before each frame, so this is only the
+        // allocation the renderer starts from.
+        let initial = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+        match gpui_wgpu::WgpuHeadlessRenderer::new(initial) {
+            Ok(renderer) => Some(Box::new(renderer)),
+            Err(error) => {
+                log::warn!("no headless wgpu renderer available: {error:#}");
+                None
+            }
+        }
     }
 }
 
