@@ -7,7 +7,6 @@ use crate::{
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
-#[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -20,6 +19,7 @@ use std::{
 
 pub(crate) struct TestWindowState {
     pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) scale_factor: f32,
     pub(crate) handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
     pub(crate) title: Option<String>,
@@ -84,6 +84,7 @@ impl TestWindow {
         };
         Self(Rc::new(Mutex::new(TestWindowState {
             bounds: params.bounds,
+            scale_factor: 2.0,
             display,
             platform,
             handle,
@@ -209,6 +210,10 @@ impl TestWindow {
     pub fn set_start_external_drag_result(&self, result: bool) {
         self.0.lock().start_external_drag_result = result;
     }
+
+    pub fn set_scale_factor(&self, scale_factor: f32) {
+        self.0.lock().scale_factor = scale_factor;
+    }
 }
 
 impl PlatformWindow for TestWindow {
@@ -234,7 +239,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        2.0
+        self.0.lock().scale_factor
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -418,7 +423,6 @@ impl PlatformWindow for TestWindow {
         self.0.lock().sprite_atlas.clone()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
@@ -428,6 +432,21 @@ impl PlatformWindow for TestWindow {
             renderer.render_scene_to_image(scene, device_size)
         } else {
             anyhow::bail!("render_to_image not available: no HeadlessRenderer configured")
+        }
+    }
+
+    fn render_to_frame(
+        &self,
+        scene: &Scene,
+        scale_factor: f32,
+    ) -> anyhow::Result<crate::HeadlessFrame> {
+        let mut state = self.0.lock();
+        let size = state.bounds.size;
+        if let Some(renderer) = &mut state.renderer {
+            let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
+            renderer.render_scene_to_frame(scene, device_size, scale_factor)
+        } else {
+            anyhow::bail!("render_to_frame not available: no HeadlessRenderer configured")
         }
     }
 

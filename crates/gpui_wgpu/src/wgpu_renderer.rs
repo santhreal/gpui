@@ -176,11 +176,21 @@ enum InstanceData {
     },
 }
 
+/// The render target backing a WgpuRenderer (either an on-screen window surface or an offscreen texture).
+enum WgpuRenderTarget {
+    Surface(wgpu::Surface<'static>),
+    Offscreen {
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        format: wgpu::TextureFormat,
+    },
+}
+
 /// GPU resources that must be dropped together during device recovery.
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    surface: wgpu::Surface<'static>,
+    target: WgpuRenderTarget,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
@@ -307,7 +317,7 @@ impl WgpuRenderer {
         Self::new_internal(
             Some(Rc::clone(&gpu_context)),
             context,
-            surface,
+            WgpuRenderTarget::Surface(surface),
             config,
             compositor_gpu,
             atlas,
@@ -335,59 +345,121 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let atlas = Arc::new(WgpuAtlas::from_context(context));
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(
+            None,
+            context,
+            WgpuRenderTarget::Surface(surface),
+            config,
+            None,
+            atlas,
+        )
+    }
+
+    /// Creates a new offscreen WgpuRenderer with an owned texture render target.
+    pub fn new_offscreen(context: &WgpuContext, size: Size<DevicePixels>) -> anyhow::Result<Self> {
+        let format = context.color_texture_format();
+        let width = (size.width.0 as u32).max(1);
+        let height = (size.height.0 as u32).max(1);
+
+        let texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen_render_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let target = WgpuRenderTarget::Offscreen {
+            texture,
+            view,
+            format,
+        };
+
+        let config = WgpuSurfaceConfig {
+            size,
+            transparent: true,
+            preferred_present_mode: None,
+        };
+
+        let atlas = Arc::new(WgpuAtlas::from_context(context));
+
+        Self::new_internal(None, context, target, config, None, atlas)
     }
 
     fn new_internal(
         gpu_context: Option<GpuContext>,
         context: &WgpuContext,
-        surface: wgpu::Surface<'static>,
+        target: WgpuRenderTarget,
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let surface_caps = surface.get_capabilities(&context.adapter);
-        let preferred_formats = [
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Rgba8Unorm,
-        ];
-        let surface_format = preferred_formats
-            .iter()
-            .find(|f| surface_caps.formats.contains(f))
-            .copied()
-            .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
-            .or_else(|| surface_caps.formats.first().copied())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Surface reports no supported texture formats for adapter {:?}",
-                    context.adapter.get_info().name
-                )
-            })?;
-
-        let pick_alpha_mode =
-            |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
-                preferences
+        let (surface_format, transparent_alpha_mode, opaque_alpha_mode) = match &target {
+            WgpuRenderTarget::Surface(surface) => {
+                let surface_caps = surface.get_capabilities(&context.adapter);
+                let preferred_formats = [
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ];
+                let surface_format = preferred_formats
                     .iter()
-                    .find(|p| surface_caps.alpha_modes.contains(p))
+                    .find(|f| surface_caps.formats.contains(f))
                     .copied()
-                    .or_else(|| surface_caps.alpha_modes.first().copied())
+                    .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+                    .or_else(|| surface_caps.formats.first().copied())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Surface reports no supported alpha modes for adapter {:?}",
+                            "Surface reports no supported texture formats for adapter {:?}",
                             context.adapter.get_info().name
                         )
-                    })
-            };
+                    })?;
 
-        let transparent_alpha_mode = pick_alpha_mode(&[
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::Inherit,
-        ])?;
+                let pick_alpha_mode =
+                    |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
+                        preferences
+                            .iter()
+                            .find(|p| surface_caps.alpha_modes.contains(p))
+                            .copied()
+                            .or_else(|| surface_caps.alpha_modes.first().copied())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Surface reports no supported alpha modes for adapter {:?}",
+                                    context.adapter.get_info().name
+                                )
+                            })
+                    };
 
-        let opaque_alpha_mode = pick_alpha_mode(&[
-            wgpu::CompositeAlphaMode::Opaque,
-            wgpu::CompositeAlphaMode::Inherit,
-        ])?;
+                let transparent_alpha_mode = pick_alpha_mode(&[
+                    wgpu::CompositeAlphaMode::PreMultiplied,
+                    wgpu::CompositeAlphaMode::Inherit,
+                ])?;
+
+                let opaque_alpha_mode = pick_alpha_mode(&[
+                    wgpu::CompositeAlphaMode::Opaque,
+                    wgpu::CompositeAlphaMode::Inherit,
+                ])?;
+                (surface_format, transparent_alpha_mode, opaque_alpha_mode)
+            }
+            WgpuRenderTarget::Offscreen { format, .. } => {
+                // Note: For offscreen rendering on this platform, we explicitly use the color texture format
+                // selected by the WgpuContext (typically Bgra8Unorm on native platforms), matching the windowed path.
+                // A format change here changes the readback byte order.
+                // For offscreen rendering without a compositor, we use Auto/PostMultiplied for straight alpha.
+                (
+                    *format,
+                    wgpu::CompositeAlphaMode::Auto,
+                    wgpu::CompositeAlphaMode::Opaque,
+                )
+            }
+        };
 
         let alpha_mode = if config.transparent {
             transparent_alpha_mode
@@ -416,18 +488,23 @@ impl WgpuRenderer {
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: config
-                .preferred_present_mode
-                .filter(|mode| surface_caps.present_modes.contains(mode))
-                .unwrap_or(wgpu::PresentMode::Fifo),
+            present_mode: match &target {
+                WgpuRenderTarget::Surface(surface) => {
+                    let surface_caps = surface.get_capabilities(&context.adapter);
+                    config
+                        .preferred_present_mode
+                        .filter(|mode| surface_caps.present_modes.contains(mode))
+                        .unwrap_or(wgpu::PresentMode::Fifo)
+                }
+                WgpuRenderTarget::Offscreen { .. } => wgpu::PresentMode::Fifo,
+            },
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
         };
-        // Configure the surface immediately. The adapter selection process already validated
-        // that this adapter can successfully configure this surface.
-        surface.configure(&context.device, &surface_config);
-
+        if let WgpuRenderTarget::Surface(surface) = &target {
+            surface.configure(&context.device, &surface_config);
+        }
         let queue = Arc::clone(&context.queue);
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
@@ -564,7 +641,7 @@ impl WgpuRenderer {
         let resources = WgpuResources {
             device,
             queue,
-            surface,
+            target,
             pipelines,
             bind_group_layouts,
             atlas_sampler,
@@ -593,7 +670,10 @@ impl WgpuRenderer {
             instance_data_alignment,
             uses_webgl_instance_data,
             rendering_params,
-            is_bgr: false,
+            is_bgr: match surface_format {
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => true,
+                _ => false,
+            },
             dual_source_blending,
             adapter_info,
             transparent_alpha_mode,
@@ -1159,10 +1239,36 @@ impl WgpuRenderer {
                 texture.destroy();
             }
 
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
-
+            match &mut resources.target {
+                WgpuRenderTarget::Surface(surface) => {
+                    surface.configure(&resources.device, &surface_config);
+                }
+                WgpuRenderTarget::Offscreen {
+                    texture,
+                    view,
+                    format,
+                } => {
+                    texture.destroy();
+                    let new_texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("offscreen_render_target"),
+                        size: wgpu::Extent3d {
+                            width: surface_config.width,
+                            height: surface_config.height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: *format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    });
+                    let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    *texture = new_texture;
+                    *view = new_view;
+                }
+            }
             // Invalidate intermediate textures - they will be lazily recreated
             // in draw() after we confirm the surface is healthy. This avoids
             // panics when the device/surface is in an invalid state during resize.
@@ -1218,9 +1324,9 @@ impl WgpuRenderer {
             let Some(resources) = self.resources.as_mut() else {
                 return;
             };
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            if let WgpuRenderTarget::Surface(surface) = &mut resources.target {
+                surface.configure(&resources.device, &surface_config);
+            }
             resources.pipelines = Self::create_pipelines(
                 &resources.device,
                 &resources.bind_group_layouts,
@@ -1308,42 +1414,51 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let frame = match self.resources().surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                *self.last_error.lock().unwrap() =
-                    Some("Surface texture validation error".to_string());
-                return false;
-            }
+        enum AcquiredFrame {
+            Surface(wgpu::SurfaceTexture),
+            Offscreen,
+        }
+
+        let (acquired_frame, frame_view) = match &self.resources().target {
+            WgpuRenderTarget::Surface(surface) => match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame) => {
+                    let view = frame
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    (AcquiredFrame::Surface(frame), view)
+                }
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    // Textures must be destroyed before the surface can be reconfigured.
+                    drop(frame);
+                    let surface_config = self.surface_config.clone();
+                    let resources = self.resources_mut();
+                    if let WgpuRenderTarget::Surface(s) = &resources.target {
+                        s.configure(&resources.device, &surface_config);
+                    }
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                    let surface_config = self.surface_config.clone();
+                    let resources = self.resources_mut();
+                    if let WgpuRenderTarget::Surface(s) = &resources.target {
+                        s.configure(&resources.device, &surface_config);
+                    }
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    *self.last_error.lock().unwrap() =
+                        Some("Surface texture validation error".to_string());
+                    return false;
+                }
+            },
+            WgpuRenderTarget::Offscreen { view, .. } => (AcquiredFrame::Offscreen, view.clone()),
         };
 
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
-
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1398,10 +1513,12 @@ impl WgpuRenderer {
             return false;
         }
 
-        frame.present();
+        match acquired_frame {
+            AcquiredFrame::Surface(frame) => frame.present(),
+            AcquiredFrame::Offscreen => {}
+        }
         true
     }
-
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
         let mut instance_offset = 0;
         let instance_bindings = self
@@ -2027,7 +2144,7 @@ impl WgpuRenderer {
                 .as_mut()
                 .expect("GPU resources not available");
             surface.configure(&res.device, &self.surface_config);
-            res.surface = surface;
+            res.target = WgpuRenderTarget::Surface(surface);
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
@@ -2122,7 +2239,7 @@ impl WgpuRenderer {
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
-            surface,
+            WgpuRenderTarget::Surface(surface),
             config,
             self.compositor_gpu,
             self.atlas.clone(),
@@ -2130,6 +2247,163 @@ impl WgpuRenderer {
 
         log::info!("GPU recovery complete");
         Ok(())
+    }
+
+    /// Reads back pixels from the offscreen render target as tightly packed RGBA8 rows.
+    ///
+    /// Copies the rendered texture to a host-visible staging buffer, waits for GPU completion,
+    /// and strips any row padding required by wgpu (256-byte row alignment).
+    /// If the texture format is Bgra8Unorm, pixels are swizzled to RGBA8 so the returned bytes
+    /// are consistently RGBA.
+    pub fn read_pixels(&self) -> anyhow::Result<Vec<u8>> {
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GPU resources not available"))?;
+        let (texture, format) = match &resources.target {
+            WgpuRenderTarget::Offscreen {
+                texture, format, ..
+            } => (texture, *format),
+            WgpuRenderTarget::Surface(_) => {
+                anyhow::bail!("read_pixels is only supported on offscreen renderers")
+            }
+        };
+
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        if width == 0 || height == 0 {
+            return Ok(Vec::new());
+        }
+
+        let bytes_per_pixel = 4u32;
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let buffer_size = (padded_bytes_per_row * height) as u64;
+
+        let output_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen_readback_buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("readback_encoder"),
+                });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        resources.queue.submit(std::iter::once(encoder.finish()));
+
+        let buffer_slice = output_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+        resources.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })?;
+
+        match receiver.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Failed to map readback buffer: {e:?}")),
+            Err(e) => Err(anyhow::anyhow!("Readback channel dropped: {e:?}")),
+        }?;
+        let mapped_data = buffer_slice.get_mapped_range();
+        let is_bgra = format == wgpu::TextureFormat::Bgra8Unorm
+            || format == wgpu::TextureFormat::Bgra8UnormSrgb;
+
+        let mut result = Vec::with_capacity((width * height * bytes_per_pixel) as usize);
+        for row in 0..height {
+            let start = (row * padded_bytes_per_row) as usize;
+            let end = start + unpadded_bytes_per_row as usize;
+            let row_bytes = &mapped_data[start..end];
+            if is_bgra {
+                for chunk in row_bytes.chunks_exact(4) {
+                    result.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+                }
+            } else {
+                result.extend_from_slice(row_bytes);
+            }
+        }
+
+        drop(mapped_data);
+        output_buffer.unmap();
+
+        Ok(result)
+    }
+}
+
+/// A headless WGPU renderer implementing `PlatformHeadlessRenderer`.
+pub struct WgpuHeadlessRenderer {
+    #[allow(dead_code)]
+    context: WgpuContext,
+    renderer: WgpuRenderer,
+}
+
+impl WgpuHeadlessRenderer {
+    /// Creates a new headless WGPU renderer for offscreen rasterization.
+    pub fn new(size: Size<DevicePixels>) -> anyhow::Result<Self> {
+        let instance = WgpuContext::surfaceless_instance();
+        let context = WgpuContext::new_surfaceless(instance, None)?;
+        let renderer = WgpuRenderer::new_offscreen(&context, size)?;
+        Ok(Self { context, renderer })
+    }
+
+    /// Reads back pixels from the renderer as RGBA8 bytes.
+    pub fn read_pixels(&self) -> anyhow::Result<Vec<u8>> {
+        self.renderer.read_pixels()
+    }
+}
+
+impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
+    fn render_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<gpui::RgbaImage> {
+        self.render_scene(scene, size)?;
+        let bytes = self.renderer.read_pixels()?;
+        gpui::RgbaImage::from_raw(size.width.0 as u32, size.height.0 as u32, bytes)
+            .ok_or_else(|| anyhow::anyhow!("Failed to construct RgbaImage from rendered buffer"))
+    }
+
+    fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
+        self.renderer.update_drawable_size(size);
+        if !self.renderer.draw(scene) {
+            anyhow::bail!("Offscreen WGPU render failed");
+        }
+        Ok(())
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
+        self.renderer.sprite_atlas().clone()
     }
 }
 
@@ -2239,5 +2513,292 @@ mod tests {
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+    }
+
+    fn build_test_quad_scene(x: f32, width: f32, height: f32) -> Scene {
+        use gpui::{
+            Bounds, ContentMask, Corners, Edges, Hsla, Point, ScaledPixels, Size, solid_background,
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: Default::default(),
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(x),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(width),
+                    height: ScaledPixels(height),
+                },
+            },
+            content_mask: ContentMask {
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(x + width + 100.0),
+                        height: ScaledPixels(height + 100.0),
+                    },
+                },
+            },
+            background: solid_background(Hsla {
+                h: 0.0,
+                s: 1.0,
+                l: 0.5,
+                a: 1.0,
+            }),
+            border_color: Hsla::default(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        scene
+    }
+
+    #[test]
+    fn test_scene_renders_expected_geometry_at_scale_factors() {
+        let instance = WgpuContext::surfaceless_instance();
+        let context = WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+
+        // Scale factor 1.0: 120x80 logical = 120x80 device
+        let size_1x = gpui::size(gpui::DevicePixels(120), gpui::DevicePixels(80));
+        let mut renderer_1x = WgpuRenderer::new_offscreen(&context, size_1x).expect("renderer 1x");
+        let scene_1x = build_test_quad_scene(10.0, 50.0, 50.0);
+        assert!(renderer_1x.draw(&scene_1x));
+        let bytes_1x = renderer_1x.read_pixels().expect("read pixels 1x");
+        assert_eq!(bytes_1x.len(), 120 * 80 * 4);
+
+        // Scale factor 2.0: 120x80 logical @ 2.0 = 240x160 device
+        let size_2x = gpui::size(gpui::DevicePixels(240), gpui::DevicePixels(160));
+        let mut renderer_2x = WgpuRenderer::new_offscreen(&context, size_2x).expect("renderer 2x");
+        let scene_2x = build_test_quad_scene(20.0, 100.0, 100.0);
+        assert!(renderer_2x.draw(&scene_2x));
+        let bytes_2x = renderer_2x.read_pixels().expect("read pixels 2x");
+        assert_eq!(bytes_2x.len(), 240 * 160 * 4);
+    }
+
+    #[test]
+    fn test_row_unpadding_at_non_multiple_of_64() {
+        let instance = WgpuContext::surfaceless_instance();
+        let context = WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+
+        // Width 300 is not a multiple of 64. 300 * 4 = 1200 bytes per row, padded to 1280.
+        let width = 300;
+        let height = 100;
+        let size = gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height));
+        let mut renderer = WgpuRenderer::new_offscreen(&context, size).expect("offscreen renderer");
+
+        // Render a solid red quad from x = 50 to x = 100, across all y = 0..100
+        let scene = build_test_quad_scene(50.0, 50.0, 100.0);
+        assert!(renderer.draw(&scene));
+        let bytes = renderer.read_pixels().expect("read pixels");
+        assert_eq!(bytes.len(), (width * height * 4) as usize);
+
+        // Verify the vertical edge: column 49 is clear, column 50 is red, column 99 is red, column 100 is clear.
+        // If rows were sheared due to stride padding mismatch, these column positions would drift per row.
+        for y in 0..height {
+            let row_offset = (y * width * 4) as usize;
+
+            // Column 49: transparent black (0, 0, 0, 0)
+            let col_49 = row_offset + 49 * 4;
+            assert_eq!(
+                &bytes[col_49..col_49 + 4],
+                &[0, 0, 0, 0],
+                "column 49 should be transparent on row {y}"
+            );
+
+            // Column 50: red pixel (255, 0, 0, 255)
+            let col_50 = row_offset + 50 * 4;
+            assert_eq!(
+                bytes[col_50 + 3],
+                255,
+                "column 50 alpha should be 255 on row {y}"
+            );
+            assert!(
+                bytes[col_50] > 200,
+                "column 50 red should be > 200 on row {y}"
+            );
+
+            // Column 99: red pixel (255, 0, 0, 255)
+            let col_99 = row_offset + 99 * 4;
+            assert_eq!(
+                bytes[col_99 + 3],
+                255,
+                "column 99 alpha should be 255 on row {y}"
+            );
+
+            // Column 100: transparent black (0, 0, 0, 0)
+            let col_100 = row_offset + 100 * 4;
+            assert_eq!(
+                &bytes[col_100..col_100 + 4],
+                &[0, 0, 0, 0],
+                "column 100 should be transparent on row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_determinism_in_one_process() {
+        let instance = WgpuContext::surfaceless_instance();
+        let context = WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+        let size = gpui::size(gpui::DevicePixels(200), gpui::DevicePixels(100));
+
+        let mut renderer1 = WgpuRenderer::new_offscreen(&context, size).expect("renderer 1");
+        let scene = build_test_quad_scene(30.0, 80.0, 60.0);
+        assert!(renderer1.draw(&scene));
+        let bytes1 = renderer1.read_pixels().expect("read pixels 1");
+
+        let mut renderer2 = WgpuRenderer::new_offscreen(&context, size).expect("renderer 2");
+        assert!(renderer2.draw(&scene));
+        let bytes2 = renderer2.read_pixels().expect("read pixels 2");
+
+        assert_eq!(
+            bytes1, bytes2,
+            "offscreen render must be deterministic within one process"
+        );
+    }
+
+    #[test]
+    fn test_determinism_across_processes() {
+        if std::env::var("P10_CHILD_DETERMINISM").is_ok() {
+            let instance = WgpuContext::surfaceless_instance();
+            let context =
+                WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+            let size = gpui::size(gpui::DevicePixels(200), gpui::DevicePixels(100));
+            let mut renderer = WgpuRenderer::new_offscreen(&context, size).expect("renderer");
+            let scene = build_test_quad_scene(30.0, 80.0, 60.0);
+            assert!(renderer.draw(&scene));
+            let bytes = renderer.read_pixels().expect("read pixels");
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout();
+            stdout.write_all(b"P10_BYTES:").unwrap();
+            for b in &bytes {
+                write!(stdout, "{:02x}", b).unwrap();
+            }
+            writeln!(stdout).unwrap();
+            return;
+        }
+
+        let instance = WgpuContext::surfaceless_instance();
+        let context = WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+        let size = gpui::size(gpui::DevicePixels(200), gpui::DevicePixels(100));
+        let mut renderer = WgpuRenderer::new_offscreen(&context, size).expect("renderer");
+        let scene = build_test_quad_scene(30.0, 80.0, 60.0);
+        assert!(renderer.draw(&scene));
+        let parent_bytes = renderer.read_pixels().expect("read pixels");
+
+        // Spawn second process
+        if let Ok(current_exe) = std::env::current_exe() {
+            let output = std::process::Command::new(current_exe)
+                .arg("wgpu_renderer::tests::test_determinism_across_processes")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("P10_CHILD_DETERMINISM", "1")
+                .output();
+
+            if let Ok(output) = output {
+                let stdout_str = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout_str.lines().find(|l| l.starts_with("P10_BYTES:")) {
+                    let hex_str = line.trim_start_matches("P10_BYTES:");
+                    let child_bytes: Vec<u8> = (0..hex_str.len())
+                        .step_by(2)
+                        .filter_map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).ok())
+                        .collect();
+                    assert_eq!(
+                        parent_bytes, child_bytes,
+                        "render output must match exactly across processes"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_text_is_really_rasterized() {
+        use crate::cosmic_text_system::CosmicTextSystem;
+        use gpui::{
+            AppContext, Context, HeadlessAppContext, IntoElement, ParentElement,
+            PlatformHeadlessRenderer, Render, Styled, Window, div, px, size,
+        };
+        use std::sync::Arc;
+
+        struct TextView;
+        impl Render for TextView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .text_color(gpui::rgb(0xffffff))
+                    .child("Hello, Headless Rasterizer!")
+            }
+        }
+
+        struct EmptyView;
+        impl Render for EmptyView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+            }
+        }
+
+        let text_system = Arc::new(CosmicTextSystem::new("sans-serif"));
+        let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), || {
+            WgpuHeadlessRenderer::new(size(gpui::DevicePixels(200), gpui::DevicePixels(100)))
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn PlatformHeadlessRenderer>)
+        });
+
+        let text_frame = cx
+            .render_frame(size(px(200.0), px(100.0)), 1.0, |_window, cx| {
+                cx.new(|_| TextView)
+            })
+            .expect("render text frame");
+
+        let empty_frame = cx
+            .render_frame(size(px(200.0), px(100.0)), 1.0, |_window, cx| {
+                cx.new(|_| EmptyView)
+            })
+            .expect("render empty frame");
+
+        assert_ne!(
+            text_frame.as_bytes(),
+            empty_frame.as_bytes(),
+            "frame with text must differ from frame without text"
+        );
+
+        // Verify text frame is not a uniform color (contains non-zero alpha / color text pixels)
+        let text_bytes = text_frame.as_bytes();
+        let has_text_pixels = text_bytes.chunks_exact(4).any(|p| p[3] > 0 || p[0] > 0);
+        assert!(
+            has_text_pixels,
+            "text frame must contain rasterized glyph pixels"
+        );
+    }
+
+    #[test]
+    fn test_cleared_frame_is_exactly_clear_color() {
+        let instance = WgpuContext::surfaceless_instance();
+        let context = WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+        let size = gpui::size(gpui::DevicePixels(100), gpui::DevicePixels(100));
+        let mut renderer = WgpuRenderer::new_offscreen(&context, size).expect("renderer");
+
+        let empty_scene = Scene::default();
+        assert!(renderer.draw(&empty_scene));
+        let bytes = renderer.read_pixels().expect("read pixels");
+
+        assert_eq!(bytes.len(), 100 * 100 * 4);
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "cleared frame must have all zero bytes (transparent black), proving no garbage initialization"
+        );
     }
 }

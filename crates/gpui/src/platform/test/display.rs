@@ -2,6 +2,7 @@ use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Point, px};
 use anyhow::{Ok, Result};
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct TestDisplay {
     id: DisplayId,
     uuid: uuid::Uuid,

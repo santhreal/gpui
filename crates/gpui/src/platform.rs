@@ -12,7 +12,6 @@ pub mod popup;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod threaded_dispatcher;
 
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod test;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
@@ -47,8 +46,7 @@ use anyhow::bail;
 use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
-use image::RgbaImage;
+pub use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -78,11 +76,10 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+pub use test::TestDispatcher;
 pub(crate) use test::*;
-
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+pub use test::{TestScreenCaptureSource, TestScreenCaptureStream};
 
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub use threaded_dispatcher::ThreadedDispatcher;
@@ -979,7 +976,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Inform the adapter of updated window bounds.
     fn a11y_update_window_bounds(&self) {}
 
-    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
     }
@@ -987,14 +983,73 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
+    }
+
+    /// Renders the given scene to a frame containing RGBA8 pixels and geometry metadata.
+    fn render_to_frame(&self, scene: &Scene, scale_factor: f32) -> Result<HeadlessFrame> {
+        let image = self.render_to_image(scene)?;
+        let (width, height) = image.dimensions();
+        Ok(HeadlessFrame::new(
+            width,
+            height,
+            scale_factor,
+            image.into_raw(),
+        ))
+    }
+}
+
+/// A rasterized headless frame containing RGBA8 pixels and geometry metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeadlessFrame {
+    width: u32,
+    height: u32,
+    scale_factor: f32,
+    bytes: Vec<u8>,
+}
+
+impl HeadlessFrame {
+    /// Creates a new `HeadlessFrame`.
+    pub fn new(width: u32, height: u32, scale_factor: f32, bytes: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            scale_factor,
+            bytes,
+        }
+    }
+
+    /// The width in device pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The height in device pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The device pixel ratio (scale factor).
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    /// Consumes the frame and returns the raw RGBA8 bytes.
+    ///
+    /// The buffer contains tightly packed 4-byte RGBA pixels with no row padding,
+    /// in row-major order.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Returns a slice of the raw RGBA8 bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
 /// A renderer for headless windows that can produce real rendered output.
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub trait PlatformHeadlessRenderer {
     /// Render a scene and return the result as an RGBA image.
     fn render_scene_to_image(
@@ -1009,6 +1064,23 @@ pub trait PlatformHeadlessRenderer {
     /// same CPU-side scene encoding and GPU submission as drawing to a real
     /// window, but doesn't block on GPU completion or copy pixels back.
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()>;
+
+    /// Render a scene to a `HeadlessFrame`.
+    fn render_scene_to_frame(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        scale_factor: f32,
+    ) -> Result<HeadlessFrame> {
+        let image = self.render_scene_to_image(scene, size)?;
+        let (width, height) = image.dimensions();
+        Ok(HeadlessFrame::new(
+            width,
+            height,
+            scale_factor,
+            image.into_raw(),
+        ))
+    }
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
@@ -1060,7 +1132,6 @@ pub trait PlatformDispatcher: Send + Sync {
         gpui_util::defer(Box::new(|| {}))
     }
 
-    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_test(&self) -> Option<&TestDispatcher> {
         None
     }
@@ -1336,12 +1407,10 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
-    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
     }
 }
-
 #[doc(hidden)]
 pub struct AtlasTextureList<T> {
     pub textures: Vec<Option<T>>,

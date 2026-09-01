@@ -10,9 +10,9 @@
 
 use crate::{
     AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetSource, BackgroundExecutor, Bounds,
-    Context, Entity, EntityId, ForegroundExecutor, Global, Pixels, PlatformHeadlessRenderer,
-    PlatformTextSystem, Render, Reservation, Size, Task, TestDispatcher, TestPlatform, TextSystem,
-    Window, WindowBounds, WindowHandle, WindowOptions,
+    Context, Entity, EntityId, ForegroundExecutor, Global, HeadlessFrame, Pixels,
+    PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Size, Task, TestDispatcher,
+    TestPlatform, TextSystem, Window, WindowBounds, WindowHandle, WindowOptions,
     app::{GpuiBorrow, GpuiMode},
 };
 use anyhow::Result;
@@ -87,9 +87,9 @@ impl HeadlessAppContext {
         );
 
         let text_system = Arc::new(TextSystem::new(platform_text_system));
-        let http_client = http_client::FakeHttpClient::with_404_response();
+        let http_client = Arc::new(crate::app::NullHttpClient);
         let app = App::new_app(platform, asset_source, http_client);
-        app.borrow_mut().mode = GpuiMode::test();
+        app.borrow_mut().mode = GpuiMode::Production;
 
         Self {
             app,
@@ -170,6 +170,36 @@ impl HeadlessAppContext {
         app.update_window(window, |_, window, _| window.render_to_image())?
     }
 
+    /// Captures a headless frame containing RGBA8 pixels and geometry metadata.
+    pub fn capture_frame(
+        &mut self,
+        window: AnyWindowHandle,
+        scale_factor: f32,
+    ) -> Result<HeadlessFrame> {
+        let mut app = self.app.borrow_mut();
+        app.update_window(window, |_, window, _| window.render_to_frame(scale_factor))?
+    }
+
+    /// Renders an element tree to a `HeadlessFrame` at the given logical size and scale factor.
+    pub fn render_frame<V: Render + 'static>(
+        &mut self,
+        size: Size<Pixels>,
+        scale_factor: f32,
+        build_root: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+    ) -> Result<HeadlessFrame> {
+        let window = self.open_window(size, build_root)?;
+        self.update_window(window.into(), |_, window, _| {
+            window.set_scale_factor(scale_factor);
+        })?;
+        self.run_until_parked();
+        let frame = self.update_window(window.into(), |_, window, _| {
+            window.render_to_frame(scale_factor)
+        })??;
+        self.update(|cx| {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        });
+        Ok(frame)
+    }
     /// Returns the text system.
     pub fn text_system(&self) -> &Arc<TextSystem> {
         &self.text_system

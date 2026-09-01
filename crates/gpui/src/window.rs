@@ -2458,10 +2458,15 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
+    }
+
+    /// Renders the current frame's scene to a `HeadlessFrame` containing RGBA8 pixels.
+    pub fn render_to_frame(&self, scale_factor: f32) -> anyhow::Result<crate::HeadlessFrame> {
+        self.platform_window
+            .render_to_frame(&self.rendered_frame.scene, scale_factor)
     }
 
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
@@ -2637,8 +2642,7 @@ impl Window {
         self.scale_factor
     }
 
-    /// Overrides the display scale factor for tests.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Overrides the display scale factor.
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
