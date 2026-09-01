@@ -3279,4 +3279,145 @@ mod tests {
             assert_eq!(empty_frame.hitboxes().len(), 0);
         }
     }
+    #[test]
+    fn test_per_corner_radii_on_single_quad_at_scale_factors() {
+        use gpui::{Bounds, ContentMask, Corners, Edges, Hsla, Point, ScaledPixels, Scene, Size};
+
+        for scale in [1.0, 2.0] {
+            let width = (100.0 * scale) as i32;
+            let height = (100.0 * scale) as i32;
+
+            let instance = WgpuContext::surfaceless_instance();
+            let context =
+                WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+            let size_device = gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height));
+            let mut renderer =
+                WgpuRenderer::new_offscreen(&context, size_device).expect("renderer");
+
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                order: 0,
+                border_style: Default::default(),
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(100.0 * scale),
+                        height: ScaledPixels(100.0 * scale),
+                    },
+                },
+                content_mask: ContentMask {
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(0.0),
+                            y: ScaledPixels(0.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(100.0 * scale),
+                            height: ScaledPixels(100.0 * scale),
+                        },
+                    },
+                },
+                background: gpui::solid_background(Hsla {
+                    h: 0.0,
+                    s: 1.0,
+                    l: 0.5,
+                    a: 1.0,
+                }),
+                border_color: Hsla::default(),
+                corner_radii: Corners {
+                    top_left: ScaledPixels(20.0 * scale),
+                    top_right: ScaledPixels(0.0),
+                    bottom_right: ScaledPixels(30.0 * scale),
+                    bottom_left: ScaledPixels(10.0 * scale),
+                },
+                border_widths: Edges::default(),
+                transformation: TransformationMatrix::unit(),
+            });
+
+            assert!(renderer.draw(&scene));
+            let bytes = renderer.read_pixels().expect("read pixels");
+            let pitch = (100.0 * scale) as usize * 4;
+            let pixel_at = |lx: f32, ly: f32| -> [u8; 4] {
+                let px = (lx * scale) as usize;
+                let py = (ly * scale) as usize;
+                let offset = py * pitch + px * 4;
+                [
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]
+            };
+            // Corner 1: Top-Left (R = 20px)
+            // (2, 2) is outside the 20px radius arc (distance to (20,20) = ~25.46 > 20) -> alpha 0
+            let tl_outside = pixel_at(2.0, 2.0);
+            assert!(
+                tl_outside[3] < 30,
+                "TL corner outside radius (2, 2) must be unpainted (alpha 0) at scale {scale}, got {tl_outside:?}"
+            );
+            // (16, 16) is inside the 20px radius arc (distance to (20,20) = ~5.66 < 20) -> alpha 255
+            let tl_inside = pixel_at(16.0, 16.0);
+            assert!(
+                tl_inside[3] > 220 && tl_inside[0] > 220,
+                "TL corner inside radius (16, 16) must be painted at scale {scale}, got {tl_inside:?}"
+            );
+            // (5, 25) is beyond the 20px corner on the straight edge -> alpha 255
+            let tl_straight = pixel_at(5.0, 25.0);
+            assert!(
+                tl_straight[3] > 220 && tl_straight[0] > 220,
+                "TL straight edge (5, 25) must be painted at scale {scale}, got {tl_straight:?}"
+            );
+
+            // Corner 2: Top-Right (R = 0px, sharp corner)
+            // (98, 2) is in the geometric corner and must be fully painted -> alpha 255
+            let tr_corner = pixel_at(98.0, 2.0);
+            assert!(
+                tr_corner[3] > 220 && tr_corner[0] > 220,
+                "TR sharp corner (98, 2) must be painted at scale {scale}, got {tr_corner:?}"
+            );
+
+            // Corner 3: Bottom-Right (R = 30px)
+            // (98, 98) is outside the 30px radius arc (distance to (70,70) = ~39.6 > 30) -> alpha 0
+            let br_outside = pixel_at(98.0, 98.0);
+            assert!(
+                br_outside[3] < 30,
+                "BR corner outside radius (98, 98) must be unpainted (alpha 0) at scale {scale}, got {br_outside:?}"
+            );
+            // (92, 92) is also outside the 30px radius arc (distance to (70,70) = ~31.1 > 30) -> alpha 0
+            let br_outside2 = pixel_at(92.0, 92.0);
+            assert!(
+                br_outside2[3] < 30,
+                "BR corner outside radius (92, 92) must be unpainted (alpha 0) at scale {scale}, got {br_outside2:?}"
+            );
+            // (75, 75) is inside the 30px radius arc (distance to (70,70) = ~7.07 < 30) -> alpha 255
+            let br_inside = pixel_at(75.0, 75.0);
+            assert!(
+                br_inside[3] > 220 && br_inside[0] > 220,
+                "BR corner inside radius (75, 75) must be painted at scale {scale}, got {br_inside:?}"
+            );
+
+            // Corner 4: Bottom-Left (R = 10px)
+            // (2, 98) is outside the 10px radius arc (distance to (10,90) = ~11.31 > 10) -> alpha 0
+            let bl_outside = pixel_at(2.0, 98.0);
+            assert!(
+                bl_outside[3] < 30,
+                "BL corner outside radius (2, 98) must be unpainted (alpha 0) at scale {scale}, got {bl_outside:?}"
+            );
+            // (2, 85) is past the 10px radius vertically (y=85 < 90) -> alpha 255
+            let bl_straight = pixel_at(2.0, 85.0);
+            assert!(
+                bl_straight[3] > 220 && bl_straight[0] > 220,
+                "BL straight edge (2, 85) must be painted at scale {scale}, got {bl_straight:?}"
+            );
+            // (8, 92) is inside the 10px radius arc (distance to (10,90) = ~2.83 < 10) -> alpha 255
+            let bl_inside = pixel_at(8.0, 92.0);
+            assert!(
+                bl_inside[3] > 220 && bl_inside[0] > 220,
+                "BL corner inside radius (8, 92) must be painted at scale {scale}, got {bl_inside:?}"
+            );
+        }
+    }
 }
