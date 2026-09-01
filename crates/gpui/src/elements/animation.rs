@@ -19,6 +19,8 @@ use smallvec::SmallVec;
 pub struct Animation {
     /// The amount of time for which this animation should run
     pub duration: Duration,
+    /// The amount of time to wait before starting this animation
+    pub delay: Duration,
     /// Whether to repeat this animation when it finishes
     pub oneshot: bool,
     /// Whether to derive the phase from a shared clock. See [`Animation::repeat_synced`].
@@ -30,18 +32,25 @@ pub struct Animation {
     /// When `None`, the animation re-renders on every frame.
     pub max_fps: Option<f32>,
 }
-
 impl Animation {
     /// Create a new animation with the given duration.
     /// By default the animation will only run once and will use a linear easing function.
     pub fn new(duration: Duration) -> Self {
         Self {
             duration,
+            delay: Duration::ZERO,
             oneshot: true,
             synced: false,
             easing: Rc::new(linear),
             max_fps: None,
         }
+    }
+
+    /// Sets the delay before this animation starts progressing.
+    /// During the delay, the animation holds its start value (0.0).
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 
     /// Set the animation to loop when it finishes.
@@ -553,30 +562,58 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             } else {
                 let animation_ix = state.animation_ix;
                 let duration = self.animations[animation_ix].duration;
+                let delay = self.animations[animation_ix].delay;
 
-                let elapsed = if self.animations[animation_ix].synced && !duration.is_zero() {
-                    let elapsed = now - cx.synced_animation_epoch;
-                    // Reduce modulo the duration before f32 conversion, which loses sub-second precision at scale.
-                    Duration::from_nanos((elapsed.as_nanos() % duration.as_nanos()) as u64)
-                } else {
-                    now.saturating_duration_since(state.start)
-                };
-                let mut delta = elapsed.as_secs_f32() / duration.as_secs_f32();
-
-                let mut done = false;
-                if delta > 1.0 {
-                    if self.animations[animation_ix].oneshot {
-                        if animation_ix >= self.animations.len() - 1 {
-                            done = true;
-                        } else {
-                            state.start = now;
-                            state.animation_ix += 1;
-                        }
-                        delta = 1.0;
+                let (delta, done) = if self.animations[animation_ix].synced {
+                    let total_cycle = delay + duration;
+                    if total_cycle.is_zero() {
+                        (1.0, true)
                     } else {
-                        delta %= 1.0;
+                        let elapsed = now - cx.synced_animation_epoch;
+                        let cycle_nanos = (elapsed.as_nanos() % total_cycle.as_nanos()) as u64;
+                        let cycle_elapsed = Duration::from_nanos(cycle_nanos);
+                        if cycle_elapsed < delay {
+                            (0.0, false)
+                        } else {
+                            let active_elapsed = cycle_elapsed - delay;
+                            let delta = if duration.is_zero() {
+                                1.0
+                            } else {
+                                (active_elapsed.as_secs_f32() / duration.as_secs_f32())
+                                    .clamp(0.0, 1.0)
+                            };
+                            (delta, false)
+                        }
                     }
-                }
+                } else {
+                    let elapsed = now.saturating_duration_since(state.start);
+                    if elapsed < delay {
+                        (0.0, false)
+                    } else {
+                        let active_elapsed = elapsed - delay;
+                        let mut delta = if duration.is_zero() {
+                            1.0
+                        } else {
+                            active_elapsed.as_secs_f32() / duration.as_secs_f32()
+                        };
+
+                        let mut done = false;
+                        if delta > 1.0 {
+                            if self.animations[animation_ix].oneshot {
+                                if animation_ix >= self.animations.len() - 1 {
+                                    done = true;
+                                } else {
+                                    state.start = now;
+                                    state.animation_ix += 1;
+                                }
+                                delta = 1.0;
+                            } else {
+                                delta %= 1.0;
+                            }
+                        }
+                        (delta, done)
+                    }
+                };
                 (animation_ix, delta, done)
             };
             state.progress = delta;
@@ -1330,6 +1367,125 @@ mod tests {
         assert!(
             progress_after_remount >= progress_before_unmount,
             "remount must not reset progress to 0, was {progress_before_unmount}, got {progress_after_remount}"
+        );
+    }
+    #[gpui::test]
+    fn test_delayed_animation_holds_start_value_for_delay(cx: &mut TestAppContext) {
+        let rendered_deltas = Rc::new(RefCell::new(Vec::new()));
+
+        struct DelayedAnimationView {
+            rendered_deltas: Rc<RefCell<Vec<f32>>>,
+        }
+
+        impl Render for DelayedAnimationView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let deltas = self.rendered_deltas.clone();
+                let animation =
+                    Animation::new(Duration::from_secs(1)).with_delay(Duration::from_millis(500));
+                div().child(
+                    div().with_animation("delayed", animation, move |this, delta| {
+                        deltas.borrow_mut().push(delta);
+                        this
+                    }),
+                )
+            }
+        }
+
+        let window = cx.open_window(size(px(100.0), px(100.0)), {
+            let rendered_deltas = rendered_deltas.clone();
+            move |_, _| DelayedAnimationView { rendered_deltas }
+        });
+        cx.run_until_parked();
+
+        assert_eq!(*rendered_deltas.borrow(), vec![0.0]);
+
+        // Advance 250ms (within 500ms delay) -> still exactly 0.0
+        cx.executor().advance_clock(Duration::from_millis(250));
+        simulate_next_frame(&window, cx);
+        assert_eq!(*rendered_deltas.borrow().last().unwrap(), 0.0);
+
+        // Advance another 250ms (total 500ms elapsed = exact delay threshold) -> still 0.0
+        cx.executor().advance_clock(Duration::from_millis(250));
+        simulate_next_frame(&window, cx);
+        assert_eq!(*rendered_deltas.borrow().last().unwrap(), 0.0);
+
+        // Advance 250ms (750ms total, 250ms active into 1s animation = 0.25)
+        cx.executor().advance_clock(Duration::from_millis(250));
+        simulate_next_frame(&window, cx);
+        assert_eq!(*rendered_deltas.borrow().last().unwrap(), 0.25);
+
+        // Advance 250ms (1000ms total, 500ms active = 0.50)
+        cx.executor().advance_clock(Duration::from_millis(250));
+        simulate_next_frame(&window, cx);
+        assert_eq!(*rendered_deltas.borrow().last().unwrap(), 0.5);
+
+        // Advance 500ms (1500ms total, 1000ms active = 1.0, done)
+        cx.executor().advance_clock(Duration::from_millis(500));
+        simulate_next_frame(&window, cx);
+        assert_eq!(*rendered_deltas.borrow().last().unwrap(), 1.0);
+    }
+
+    #[gpui::test]
+    fn test_spring_reaches_rest_within_bound_and_does_not_oscillate_past_damping() {
+        // Critical damping (zeta = 1.0): monotonic approach to target with zero overshoot
+        let critical_config = SpringConfig::new(100.0, 20.0, 1.0);
+        let mut state = SpringState {
+            position: 0.0,
+            velocity: 0.0,
+        };
+        let target = 1.0;
+        let epsilon = 0.001;
+        let settle_time = critical_config.settle_time(state, target, epsilon);
+
+        let dt = 0.01;
+        let steps = (settle_time.as_secs_f32() / dt).ceil() as usize;
+        for _ in 0..steps {
+            state = critical_config.step(state, target, dt);
+            // For critical damping from below, position must never overshoot 1.0
+            assert!(
+                state.position <= target + 1e-4,
+                "critically damped spring must not overshoot target, got {}",
+                state.position
+            );
+        }
+        // At settle time, must be within epsilon of target
+        assert!(
+            (state.position - target).abs() <= epsilon,
+            "spring must reach rest within settle time"
+        );
+
+        // Underdamped spring (zeta = 0.5): oscillation amplitude bounded by e^(-pi*zeta/sqrt(1-zeta^2))
+        let underdamped_config = SpringConfig::new(100.0, 10.0, 1.0);
+        let (_, damping_ratio) = underdamped_config.canonical();
+        assert!((damping_ratio - 0.5).abs() < 1e-4);
+        let max_theoretical_overshoot = (-std::f32::consts::PI * damping_ratio
+            / (1.0 - damping_ratio * damping_ratio).sqrt())
+        .exp();
+
+        let mut under_state = SpringState {
+            position: 0.0,
+            velocity: 0.0,
+        };
+        let under_settle = underdamped_config.settle_time(under_state, target, epsilon);
+        let mut max_observed_pos = 0.0f32;
+        let under_steps = (under_settle.as_secs_f32() / dt).ceil() as usize;
+        for _ in 0..under_steps {
+            under_state = underdamped_config.step(under_state, target, dt);
+            max_observed_pos = max_observed_pos.max(under_state.position);
+        }
+
+        let observed_overshoot = max_observed_pos - target;
+        assert!(
+            observed_overshoot <= max_theoretical_overshoot + 1e-3,
+            "underdamped spring overshoot {observed_overshoot} exceeded theoretical bound {max_theoretical_overshoot}"
+        );
+        assert!(
+            (under_state.position - target).abs() <= epsilon,
+            "underdamped spring must reach rest within settle time"
         );
     }
 }
