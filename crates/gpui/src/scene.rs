@@ -760,6 +760,23 @@ impl Transformation {
             .scale(self.scale)
             .translate(center.scale(-scale_factor))
     }
+
+    /// Linearly interpolate between this and another transformation.
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            scale: crate::size(
+                self.scale.width + (other.scale.width - self.scale.width) * t,
+                self.scale.height + (other.scale.height - self.scale.height) * t,
+            ),
+            translate: crate::point(
+                crate::px(self.translate.x.0 + (other.translate.x.0 - self.translate.x.0) * t),
+                crate::px(self.translate.y.0 + (other.translate.y.0 - self.translate.y.0) * t),
+            ),
+            rotate: crate::radians(self.rotate.0 + (other.rotate.0 - self.rotate.0) * t),
+            origin: other.origin.or(self.origin),
+        }
+    }
 }
 
 /// A data type representing a 2 dimensional transformation that can be applied to an element.

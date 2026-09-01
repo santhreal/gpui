@@ -472,6 +472,14 @@ where
             height: f(self.height.clone()),
         }
     }
+
+    /// Linearly interpolates between two sizes using a custom element interpolation function.
+    pub fn lerp_by(&self, other: &Self, mut f: impl FnMut(&T, &T) -> T) -> Self {
+        Self {
+            width: f(&self.width, &other.width),
+            height: f(&self.height, &other.height),
+        }
+    }
 }
 
 impl<T> Size<T>
@@ -1902,6 +1910,16 @@ impl<T: Clone + Debug + Default + PartialEq> Edges<T> {
             || predicate(&self.bottom)
             || predicate(&self.left)
     }
+
+    /// Linearly interpolates between two edge collections using a custom element interpolation function.
+    pub fn lerp_by(&self, other: &Self, mut f: impl FnMut(&T, &T) -> T) -> Self {
+        Self {
+            top: f(&self.top, &other.top),
+            right: f(&self.right, &other.right),
+            bottom: f(&self.bottom, &other.bottom),
+            left: f(&self.left, &other.left),
+        }
+    }
 }
 
 impl Edges<Length> {
@@ -2278,34 +2296,8 @@ pub struct Corners<T: Clone + Debug + Default + PartialEq> {
     pub bottom_left: T,
 }
 
-impl<T> Corners<T>
-where
-    T: Add<T, Output = T> + Half + Clone + Debug + Default + PartialEq,
-{
+impl<T: Clone + Debug + Default + PartialEq> Corners<T> {
     /// Constructs `Corners` where all sides are set to the same specified value.
-    ///
-    /// This function creates a `Corners` instance with the `top_left`, `top_right`, `bottom_right`, and `bottom_left` fields all initialized
-    /// to the same value provided as an argument. This is useful when you want to have uniform corners around a box,
-    /// such as a uniform border radius on a rectangle.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The value to set for all four corners.
-    ///
-    /// # Returns
-    ///
-    /// An `Corners` instance with all corners set to the given value.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use gpui::Corners;
-    /// let uniform_corners = Corners::all(5.0);
-    /// assert_eq!(uniform_corners.top_left, 5.0);
-    /// assert_eq!(uniform_corners.top_right, 5.0);
-    /// assert_eq!(uniform_corners.bottom_right, 5.0);
-    /// assert_eq!(uniform_corners.bottom_left, 5.0);
-    /// ```
     pub fn all(value: T) -> Self {
         Self {
             top_left: value.clone(),
@@ -2315,6 +2307,21 @@ where
         }
     }
 
+    /// Linearly interpolates between two corner collections using a custom element interpolation function.
+    pub fn lerp_by(&self, other: &Self, mut f: impl FnMut(&T, &T) -> T) -> Self {
+        Self {
+            top_left: f(&self.top_left, &other.top_left),
+            top_right: f(&self.top_right, &other.top_right),
+            bottom_right: f(&self.bottom_right, &other.bottom_right),
+            bottom_left: f(&self.bottom_left, &other.bottom_left),
+        }
+    }
+}
+
+impl<T> Corners<T>
+where
+    T: Add<T, Output = T> + Half + Clone + Debug + Default + PartialEq,
+{
     /// Returns the requested corner value, supporting all eight corner positions.
     ///
     /// For the four basic corners (TopLeft, TopRight, BottomLeft, BottomRight),
@@ -3381,6 +3388,25 @@ impl AbsoluteLength {
             AbsoluteLength::Rems(rems) => rems,
         }
     }
+
+    /// Linearly interpolate between two absolute lengths.
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        match (self, other) {
+            (Self::Pixels(p1), Self::Pixels(p2)) => {
+                Self::Pixels(crate::px(p1.0 + (p2.0 - p1.0) * t))
+            }
+            (Self::Rems(r1), Self::Rems(r2)) => Self::Rems(crate::rems(r1.0 + (r2.0 - r1.0) * t)),
+            (Self::Pixels(p1), Self::Rems(r2)) => {
+                let p2 = r2.to_pixels(crate::px(16.0));
+                Self::Pixels(crate::px(p1.0 + (p2.0 - p1.0) * t))
+            }
+            (Self::Rems(r1), Self::Pixels(p2)) => {
+                let p1 = r1.to_pixels(crate::px(16.0));
+                Self::Pixels(crate::px(p1.0 + (p2.0 - p1.0) * t))
+            }
+        }
+    }
 }
 
 impl Default for AbsoluteLength {
@@ -3515,6 +3541,22 @@ impl DefiniteLength {
             },
         }
     }
+
+    /// Linearly interpolate between two definite lengths.
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        match (self, other) {
+            (Self::Absolute(a1), Self::Absolute(a2)) => Self::Absolute(a1.lerp(a2, t)),
+            (Self::Fraction(f1), Self::Fraction(f2)) => Self::Fraction(f1 + (f2 - f1) * t),
+            _ => {
+                if t < 0.5 {
+                    self
+                } else {
+                    other
+                }
+            }
+        }
+    }
 }
 
 impl Debug for DefiniteLength {
@@ -3626,6 +3668,24 @@ pub enum Length {
     Definite(DefiniteLength),
     /// An automatic length that is determined by the context in which it is used.
     Auto,
+}
+
+impl Length {
+    /// Linearly interpolate between two lengths.
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        match (self, other) {
+            (Self::Definite(d1), Self::Definite(d2)) => Self::Definite(d1.lerp(d2, t)),
+            (Self::Auto, Self::Auto) => Self::Auto,
+            _ => {
+                if t < 0.5 {
+                    self
+                } else {
+                    other
+                }
+            }
+        }
+    }
 }
 
 impl Debug for Length {

@@ -70,6 +70,17 @@ impl Rgba {
         }
     }
 
+    /// Linearly interpolate between this and another color.
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            r: self.r + (other.r - self.r) * t,
+            g: self.g + (other.g - self.g) * t,
+            b: self.b + (other.b - self.b) * t,
+            a: self.a + (other.a - self.a) * t,
+        }
+    }
+
     /// Returns a new RGBA color with the same red, green and blue channels, but
     /// with a new alpha value.
     ///
@@ -592,6 +603,17 @@ impl Hsla {
         }
     }
 
+    /// Linearly interpolate between this and another HSLA color.
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            h: self.h + (other.h - self.h) * t,
+            s: self.s + (other.s - self.s) * t,
+            l: self.l + (other.l - self.l) * t,
+            a: self.a + (other.a - self.a) * t,
+        }
+    }
+
     /// Returns a new HSLA color with the same hue, and lightness, but with no saturation.
     pub fn grayscale(&self) -> Self {
         Hsla {
@@ -818,6 +840,38 @@ impl Default for Background {
             color_space: ColorSpace::default(),
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(), LinearColorStop::default()],
+            pad: 0,
+        }
+    }
+}
+
+impl Background {
+    /// Linearly interpolate between two backgrounds.
+    pub fn lerp(&self, other: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            tag: if t < 0.5 { self.tag } else { other.tag },
+            color_space: if t < 0.5 {
+                self.color_space
+            } else {
+                other.color_space
+            },
+            solid: self.solid.lerp(other.solid, t),
+            gradient_angle_or_pattern_height: self.gradient_angle_or_pattern_height
+                + (other.gradient_angle_or_pattern_height - self.gradient_angle_or_pattern_height)
+                    * t,
+            colors: [
+                LinearColorStop {
+                    color: self.colors[0].color.lerp(other.colors[0].color, t),
+                    percentage: self.colors[0].percentage
+                        + (other.colors[0].percentage - self.colors[0].percentage) * t,
+                },
+                LinearColorStop {
+                    color: self.colors[1].color.lerp(other.colors[1].color, t),
+                    percentage: self.colors[1].percentage
+                        + (other.colors[1].percentage - self.colors[1].percentage) * t,
+                },
+            ],
             pad: 0,
         }
     }

@@ -2,15 +2,16 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    Pixels, Point, Radians, SharedString, Size, StrikethroughStyle, StyleRefinement, TextAlign,
-    TextOverflow, TextStyleRefinement, Transformation, UnderlineStyle, WhiteSpace, px, relative,
-    rems, size,
+    Pixels, Point, Radians, SharedString, Size, SpringConfig, StrikethroughStyle, StyleRefinement,
+    StyleTransition, TextAlign, TextOverflow, TextStyleRefinement, Transformation, UnderlineStyle,
+    WhiteSpace, px, relative, rems, size,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
     overflow_style_methods, padding_style_methods, position_style_methods,
     visibility_style_methods,
 };
+use std::time::Duration;
 const ELLIPSIS: SharedString = SharedString::new_static("…");
 
 /// A trait for elements that can be styled.
@@ -977,6 +978,24 @@ pub trait Styled: Sized {
     /// Sets the backdrop tint color overlay.
     fn backdrop_tint(mut self, tint: impl Into<Hsla>) -> Self {
         self.style().backdrop_tint = Some(tint.into());
+        self
+    }
+
+    /// Sets a declared transition for animatable style properties.
+    fn transition(mut self, transition: impl Into<StyleTransition>) -> Self {
+        self.style().transition = Some(transition.into());
+        self
+    }
+
+    /// Sets a duration-based transition for animatable style properties.
+    fn transition_duration(mut self, duration: Duration) -> Self {
+        self.style().transition = Some(StyleTransition::duration(duration));
+        self
+    }
+
+    /// Sets a spring-based transition for animatable style properties.
+    fn transition_spring(mut self, spring: SpringConfig) -> Self {
+        self.style().transition = Some(StyleTransition::spring(spring));
         self
     }
 }

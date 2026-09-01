@@ -8,13 +8,14 @@ use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Transformation,
-    TransformationMatrix, Window, black, phi, point, px, quad, rems, size,
+    PointRefinement, Rgba, SharedString, Size, SizeRefinement, SpringConfig, Styled, TextRun,
+    Transformation, TransformationMatrix, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Use this struct for interfacing with the 'debug_below' styling from your own elements.
 /// If a parent element has this style set on it, then this struct will be set as a global in
@@ -175,7 +176,7 @@ pub struct GridTemplate {
 }
 
 /// The CSS styling that can be applied to an element via the `Styled` trait
-#[derive(Clone, Refineable, Debug)]
+#[derive(Clone, Refineable, Debug, PartialEq)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Style {
     /// What layout strategy should be used?
@@ -322,6 +323,9 @@ pub struct Style {
 
     /// The backdrop tint color overlay of this element
     pub backdrop_tint: Option<Hsla>,
+
+    /// Declared transition parameters for animatable style properties
+    pub transition: Option<StyleTransition>,
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -353,6 +357,143 @@ impl Style {
         self.transformation
             .map(|t| t.into_matrix(bounds.center(), scale_factor))
             .unwrap_or(TransformationMatrix::unit())
+    }
+
+    /// Linearly interpolates all animatable properties between two styles.
+    pub fn interpolate(&self, target: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let mut result = if t < 0.5 {
+            self.clone()
+        } else {
+            target.clone()
+        };
+
+        // Background
+        result.background = match (&self.background, &target.background) {
+            (Some(b1), Some(b2)) => Some(b1.lerp(b2, t)),
+            (Some(b1), None) => {
+                let zero = Fill::Color(Background::from(
+                    b1.color().map(|c| c.solid.alpha(0.0)).unwrap_or_default(),
+                ));
+                Some(b1.lerp(&zero, t))
+            }
+            (None, Some(b2)) => {
+                let zero = Fill::Color(Background::from(
+                    b2.color().map(|c| c.solid.alpha(0.0)).unwrap_or_default(),
+                ));
+                Some(zero.lerp(b2, t))
+            }
+            (None, None) => None,
+        };
+
+        // Border color
+        result.border_color = match (self.border_color, target.border_color) {
+            (Some(c1), Some(c2)) => Some(c1.lerp(c2, t)),
+            (Some(c1), None) => Some(c1.lerp(c1.alpha(0.0), t)),
+            (None, Some(c2)) => Some(c2.alpha(0.0).lerp(c2, t)),
+            (None, None) => None,
+        };
+
+        // Opacity
+        result.opacity = match (self.opacity, target.opacity) {
+            (Some(o1), Some(o2)) => Some(o1 + (o2 - o1) * t),
+            (Some(o1), None) => Some(o1 + (1.0 - o1) * t),
+            (None, Some(o2)) => Some(1.0 + (o2 - 1.0) * t),
+            (None, None) => None,
+        };
+
+        // Transformation
+        result.transformation = match (self.transformation, target.transformation) {
+            (Some(t1), Some(t2)) => Some(t1.lerp(t2, t)),
+            (Some(t1), None) => Some(t1.lerp(Transformation::default(), t)),
+            (None, Some(t2)) => Some(Transformation::default().lerp(t2, t)),
+            (None, None) => None,
+        };
+
+        // Inset
+        result.inset = self.inset.lerp_by(&target.inset, |a, b| a.lerp(*b, t));
+
+        // Size
+        result.size = self.size.lerp_by(&target.size, |a, b| a.lerp(*b, t));
+        result.min_size = self
+            .min_size
+            .lerp_by(&target.min_size, |a, b| a.lerp(*b, t));
+        result.max_size = self
+            .max_size
+            .lerp_by(&target.max_size, |a, b| a.lerp(*b, t));
+
+        // Spacing
+        result.margin = self.margin.lerp_by(&target.margin, |a, b| a.lerp(*b, t));
+        result.padding = self.padding.lerp_by(&target.padding, |a, b| a.lerp(*b, t));
+        result.border_widths = self
+            .border_widths
+            .lerp_by(&target.border_widths, |a, b| a.lerp(*b, t));
+        result.corner_radii = self
+            .corner_radii
+            .lerp_by(&target.corner_radii, |a, b| a.lerp(*b, t));
+        result.gap = self.gap.lerp_by(&target.gap, |a, b| a.lerp(*b, t));
+
+        // Text
+        result.text = TextStyleRefinement {
+            color: match (self.text.color, target.text.color) {
+                (Some(c1), Some(c2)) => Some(c1.lerp(c2, t)),
+                (Some(c1), None) => Some(c1.lerp(c1.alpha(0.0), t)),
+                (None, Some(c2)) => Some(c2.alpha(0.0).lerp(c2, t)),
+                (None, None) => None,
+            },
+            background_color: match (self.text.background_color, target.text.background_color) {
+                (Some(c1), Some(c2)) => Some(c1.lerp(c2, t)),
+                (Some(c1), None) => Some(c1.lerp(c1.alpha(0.0), t)),
+                (None, Some(c2)) => Some(c2.alpha(0.0).lerp(c2, t)),
+                (None, None) => None,
+            },
+            font_size: match (self.text.font_size, target.text.font_size) {
+                (Some(s1), Some(s2)) => Some(s1.lerp(s2, t)),
+                (Some(s1), None) => {
+                    if t < 0.5 {
+                        Some(s1)
+                    } else {
+                        None
+                    }
+                }
+                (None, Some(s2)) => {
+                    if t < 0.5 {
+                        None
+                    } else {
+                        Some(s2)
+                    }
+                }
+                (None, None) => None,
+            },
+            ..if t < 0.5 {
+                self.text.clone()
+            } else {
+                target.text.clone()
+            }
+        };
+
+        // Backdrop
+        result.backdrop_blur = match (self.backdrop_blur, target.backdrop_blur) {
+            (Some(b1), Some(b2)) => Some(px(b1.0 + (b2.0 - b1.0) * t)),
+            (Some(b1), None) => Some(px(b1.0 * (1.0 - t))),
+            (None, Some(b2)) => Some(px(b2.0 * t)),
+            (None, None) => None,
+        };
+        result.backdrop_saturation = match (self.backdrop_saturation, target.backdrop_saturation) {
+            (Some(s1), Some(s2)) => Some(s1 + (s2 - s1) * t),
+            (Some(s1), None) => Some(s1 + (1.0 - s1) * t),
+            (None, Some(s2)) => Some(1.0 + (s2 - 1.0) * t),
+            (None, None) => None,
+        };
+        result.backdrop_tint = match (self.backdrop_tint, target.backdrop_tint) {
+            (Some(c1), Some(c2)) => Some(c1.lerp(c2, t)),
+            (Some(c1), None) => Some(c1.lerp(c1.alpha(0.0), t)),
+            (None, Some(c2)) => Some(c2.alpha(0.0).lerp(c2, t)),
+            (None, None) => None,
+        };
+
+        result.transition = target.transition.or(self.transition);
+        result
     }
 }
 
@@ -850,6 +991,7 @@ impl Default for Style {
             backdrop_blur: None,
             backdrop_saturation: None,
             backdrop_tint: None,
+            transition: None,
             debug: false,
             #[cfg(debug_assertions)]
             debug_below: false,
@@ -898,6 +1040,122 @@ impl Fill {
     pub fn color(&self) -> Option<Background> {
         match self {
             Fill::Color(color) => Some(*color),
+        }
+    }
+
+    /// Linearly interpolate between two fills.
+    pub fn lerp(&self, other: &Self, t: f32) -> Self {
+        match (self, other) {
+            (Fill::Color(b1), Fill::Color(b2)) => Fill::Color(b1.lerp(b2, t)),
+        }
+    }
+}
+
+/// The timing specification for a style transition.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StyleTransition {
+    /// The duration of the transition.
+    pub duration: Duration,
+    /// Delay before the transition starts.
+    pub delay: Duration,
+    /// Optional spring configuration. If set, spring physics drives the transition.
+    pub spring: Option<SpringConfig>,
+    /// Easing curve used for duration-based transitions.
+    pub easing: TransitionEasing,
+}
+
+impl Default for StyleTransition {
+    fn default() -> Self {
+        Self {
+            duration: Duration::from_millis(150),
+            delay: Duration::ZERO,
+            spring: None,
+            easing: TransitionEasing::Linear,
+        }
+    }
+}
+
+impl StyleTransition {
+    /// Create a duration-based transition.
+    pub fn duration(duration: Duration) -> Self {
+        Self {
+            duration,
+            delay: Duration::ZERO,
+            spring: None,
+            easing: TransitionEasing::Linear,
+        }
+    }
+
+    /// Create a spring-based transition.
+    pub fn spring(spring: SpringConfig) -> Self {
+        Self {
+            duration: Duration::ZERO,
+            delay: Duration::ZERO,
+            spring: Some(spring),
+            easing: TransitionEasing::Linear,
+        }
+    }
+
+    /// Sets the transition delay.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// Sets the transition easing.
+    pub fn with_easing(mut self, easing: TransitionEasing) -> Self {
+        self.easing = easing;
+        self
+    }
+}
+
+impl From<Duration> for StyleTransition {
+    fn from(duration: Duration) -> Self {
+        Self::duration(duration)
+    }
+}
+
+impl From<SpringConfig> for StyleTransition {
+    fn from(spring: SpringConfig) -> Self {
+        Self::spring(spring)
+    }
+}
+
+/// Easing functions for style transitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum TransitionEasing {
+    /// Linear interpolation (constant velocity).
+    #[default]
+    Linear,
+    /// Standard cubic bezier ease in and out.
+    Ease,
+    /// Accelerating from zero velocity.
+    EaseIn,
+    /// Decelerating to zero velocity.
+    EaseOut,
+    /// Accelerating then decelerating.
+    EaseInOut,
+    /// Discrete step at completion.
+    Step,
+}
+
+impl TransitionEasing {
+    /// Evaluates the easing function at normalized time $t \in [0, 1]$.
+    pub fn eval(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => t,
+            Self::Ease => crate::ease_in_out(t),
+            Self::EaseIn => t * t,
+            Self::EaseOut => t * (2.0 - t),
+            Self::EaseInOut => crate::ease_in_out(t),
+            Self::Step => {
+                if t < 1.0 {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
         }
     }
 }

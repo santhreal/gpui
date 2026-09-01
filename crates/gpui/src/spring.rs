@@ -1,5 +1,8 @@
 use std::{ops::RangeInclusive, time::Duration};
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use crate::{Hsla, Pixels, Rems, Rgba};
 
 const CRITICAL_DAMPING_TOLERANCE: f32 = 1e-4;
@@ -9,7 +12,7 @@ const DEFAULT_SPRING_EPSILON: f32 = 0.001;
 ///
 /// `stiffness` and `mass` must be finite and positive. `damping` must be finite
 /// and non-negative.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SpringConfig {
     /// The spring stiffness, conventionally written as $k$.
     pub stiffness: f32,
@@ -248,7 +251,7 @@ impl SpringConfig {
 }
 
 /// The instantaneous position and velocity of a spring.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SpringState {
     /// The current value in the animated unit.
     pub position: f32,

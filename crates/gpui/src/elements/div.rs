@@ -22,13 +22,14 @@ use crate::{
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, SpringState, Style,
+    StyleRefinement, StyleTransition, Styled, Task, TooltipId, Visibility, Window,
+    WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;
+use scheduler::Instant;
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
@@ -1243,6 +1244,23 @@ pub trait InteractiveElement: Sized {
         self.interactivity().focus_visible_style = Some(Box::new(f(StyleRefinement::default())));
         self
     }
+
+    /// Binds a stable transition handle to this element to preserve transition state across remounts.
+    fn transition_handle(mut self, handle: TransitionHandle) -> Self {
+        self.interactivity().transition_handle = Some(handle);
+        self
+    }
+
+    /// Declares a transition and binds a stable transition handle to this element.
+    fn with_transition_handle(
+        mut self,
+        transition: impl Into<StyleTransition>,
+        handle: TransitionHandle,
+    ) -> Self {
+        self.interactivity().base_style.transition = Some(transition.into());
+        self.interactivity().transition_handle = Some(handle);
+        self
+    }
 }
 
 /// A trait for elements that want to use the standard GPUI interactivity features
@@ -2086,6 +2104,7 @@ pub struct Interactivity {
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
+    pub(crate) transition_handle: Option<TransitionHandle>,
 
     pub(crate) a11y_action_listeners:
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
@@ -3287,7 +3306,7 @@ impl Interactivity {
     fn compute_style_internal(
         &self,
         hitbox: Option<&Hitbox>,
-        element_state: Option<&mut InteractiveElementState>,
+        mut element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
         cx: &mut App,
     ) -> Style {
@@ -3385,7 +3404,7 @@ impl Interactivity {
             }
         }
 
-        if let Some(element_state) = element_state {
+        if let Some(element_state) = element_state.as_mut() {
             let clicked_state = element_state
                 .clicked_state
                 .get_or_insert_with(Default::default)
@@ -3400,6 +3419,97 @@ impl Interactivity {
                 && clicked_state.element
             {
                 style.refine(active_style)
+            }
+        }
+
+        let transition_state_holder = if let Some(handle) = self.transition_handle.as_ref() {
+            Some(handle.0.clone())
+        } else if let Some(element_state) = element_state {
+            Some(
+                element_state
+                    .transition_state
+                    .get_or_insert_with(Default::default)
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
+        if let Some(transition_state_rc) = transition_state_holder {
+            if let Some(transition) = style.transition {
+                let now = cx.background_executor().now();
+                let mut state_opt = transition_state_rc.borrow_mut();
+                if let Some(state) = state_opt.as_mut() {
+                    if state.target_style != style {
+                        state.start_style = state.current_style.clone();
+                        state.target_style = style.clone();
+                        state.start_time = now;
+                        state.last_update = now;
+                        state.spring_position = 0.0;
+                        state.spring_velocity = 0.0;
+                        state.completed = false;
+                        window.request_animation_frame();
+                    }
+
+                    if !state.completed {
+                        let dt = now
+                            .saturating_duration_since(state.last_update)
+                            .as_secs_f32();
+                        state.last_update = now;
+
+                        let (progress, done) = if let Some(spring) = transition.spring {
+                            let mut s = SpringState {
+                                position: state.spring_position,
+                                velocity: state.spring_velocity,
+                            };
+                            s = spring.step(s, 1.0, dt);
+                            state.spring_position = s.position;
+                            state.spring_velocity = s.velocity;
+                            let settled =
+                                (s.position - 1.0).abs() < 0.001 && s.velocity.abs() < 0.01;
+                            (s.position, settled)
+                        } else {
+                            let elapsed = now.saturating_duration_since(state.start_time);
+                            if elapsed < transition.delay {
+                                (0.0, false)
+                            } else {
+                                let active_elapsed = elapsed - transition.delay;
+                                let norm = if transition.duration.is_zero() {
+                                    1.0
+                                } else {
+                                    active_elapsed.as_secs_f32() / transition.duration.as_secs_f32()
+                                };
+                                if norm >= 1.0 {
+                                    (1.0, true)
+                                } else {
+                                    (transition.easing.eval(norm), false)
+                                }
+                            }
+                        };
+
+                        if done {
+                            state.completed = true;
+                            state.current_style = state.target_style.clone();
+                        } else {
+                            window.request_animation_frame();
+                            state.current_style =
+                                state.start_style.interpolate(&state.target_style, progress);
+                        }
+                    }
+
+                    style = state.current_style.clone();
+                } else {
+                    *state_opt = Some(StyleTransitionState {
+                        current_style: style.clone(),
+                        start_style: style.clone(),
+                        target_style: style.clone(),
+                        start_time: now,
+                        last_update: now,
+                        spring_position: 1.0,
+                        spring_velocity: 0.0,
+                        completed: true,
+                    });
+                }
             }
         }
 
@@ -3502,6 +3612,7 @@ pub struct InteractiveElementState {
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    pub(crate) transition_state: Option<Rc<RefCell<Option<StyleTransitionState>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -3517,6 +3628,48 @@ pub struct ElementClickedState {
 impl ElementClickedState {
     fn is_clicked(&self) -> bool {
         self.group || self.element
+    }
+}
+
+/// The state of a running style transition.
+#[derive(Clone, Debug)]
+pub struct StyleTransitionState {
+    /// The current visual style (interpolated value).
+    pub current_style: Style,
+    /// The style at the beginning of the current transition.
+    pub start_style: Style,
+    /// The target style toward which we are transitioning.
+    pub target_style: Style,
+    /// The instant this transition started.
+    pub start_time: Instant,
+    /// The last time the transition was stepped.
+    pub last_update: Instant,
+    /// The current spring position coordinate ($0 \to 1$).
+    pub spring_position: f32,
+    /// The current spring velocity coordinate.
+    pub spring_velocity: f32,
+    /// Whether the transition has reached its target.
+    pub completed: bool,
+}
+
+/// A stable handle that preserves style transition state across element remounts.
+#[derive(Clone, Debug, Default)]
+pub struct TransitionHandle(pub(crate) Rc<RefCell<Option<StyleTransitionState>>>);
+
+impl TransitionHandle {
+    /// Creates a new uninitialized transition handle.
+    pub fn new() -> Self {
+        Self(Rc::new(RefCell::new(None)))
+    }
+
+    /// Returns the current interpolated style if a transition is active or has run.
+    pub fn current_style(&self) -> Option<Style> {
+        self.0.borrow().as_ref().map(|s| s.current_style.clone())
+    }
+
+    /// Resets the transition handle state.
+    pub fn reset(&self) {
+        *self.0.borrow_mut() = None;
     }
 }
 
@@ -5210,5 +5363,293 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
+    }
+
+    struct TransitionTestView {
+        hovered: bool,
+        handle: TransitionHandle,
+    }
+
+    impl Render for TransitionTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut element = div()
+                .id("transition-box")
+                .size(px(100.0))
+                .transition(Duration::from_millis(100))
+                .transition_handle(self.handle.clone())
+                .bg(crate::hsla(0.0, 1.0, 0.5, 1.0));
+
+            if self.hovered {
+                element = element.bg(crate::hsla(0.6, 1.0, 0.5, 1.0));
+            }
+
+            element
+        }
+    }
+
+    #[gpui::test]
+    fn test_style_transition_hover_flip_monotonic_ramp(cx: &mut TestAppContext) {
+        let handle = TransitionHandle::new();
+        let view_handle = handle.clone();
+        let window = cx.open_window(size(px(100.0), px(100.0)), move |_, _| TransitionTestView {
+            hovered: false,
+            handle: view_handle,
+        });
+        cx.run_until_parked();
+
+        let initial_color = handle
+            .current_style()
+            .unwrap()
+            .background
+            .unwrap()
+            .color()
+            .unwrap()
+            .solid;
+        assert!((initial_color.h - 0.0).abs() < 1e-4);
+
+        // Trigger hover state change
+        window
+            .update(cx, |view, _, cx| {
+                view.hovered = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let mut previous_hue = initial_color.h;
+        for _ in 0..5 {
+            cx.executor().advance_clock(Duration::from_millis(20));
+            window
+                .update(cx, |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                })
+                .unwrap();
+
+            let current_hue = handle
+                .current_style()
+                .unwrap()
+                .background
+                .unwrap()
+                .color()
+                .unwrap()
+                .solid
+                .h;
+            assert!(
+                current_hue >= previous_hue,
+                "color ramp must be monotonic: prev {previous_hue}, current {current_hue}"
+            );
+            previous_hue = current_hue;
+        }
+
+        // At or after 100ms, hue reaches target 0.6
+        assert!(
+            (previous_hue - 0.6).abs() < 1e-3,
+            "reached target hue, got {previous_hue}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_style_transition_mid_ramp_reanchor(cx: &mut TestAppContext) {
+        let handle = TransitionHandle::new();
+        let view_handle = handle.clone();
+        let window = cx.open_window(size(px(100.0), px(100.0)), move |_, _| TransitionTestView {
+            hovered: false,
+            handle: view_handle,
+        });
+        cx.run_until_parked();
+
+        // Start hover
+        window
+            .update(cx, |view, _, cx| {
+                view.hovered = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Advance 40ms into 100ms transition
+        cx.executor().advance_clock(Duration::from_millis(40));
+        window
+            .update(cx, |_, window, cx| {
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+
+        let hue_at_flip = handle
+            .current_style()
+            .unwrap()
+            .background
+            .unwrap()
+            .color()
+            .unwrap()
+            .solid
+            .h;
+        assert!(
+            hue_at_flip > 0.1 && hue_at_flip < 0.5,
+            "mid-flight hue should be intermediate, got {hue_at_flip}"
+        );
+
+        // Flip hover mid-flight
+        window
+            .update(cx, |view, _, cx| {
+                view.hovered = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // The instant after flip, the hue should be anchored at hue_at_flip, NOT jumping to 0.0 or 0.6
+        let hue_immediately_after_flip = handle
+            .current_style()
+            .unwrap()
+            .background
+            .unwrap()
+            .color()
+            .unwrap()
+            .solid
+            .h;
+        assert!(
+            (hue_immediately_after_flip - hue_at_flip).abs() < 0.02,
+            "mid-ramp flip must re-anchor from current value {hue_at_flip}, got {hue_immediately_after_flip}"
+        );
+
+        // Advance clock towards unhovered target (0.0)
+        let mut previous_hue = hue_immediately_after_flip;
+        for _ in 0..5 {
+            cx.executor().advance_clock(Duration::from_millis(20));
+            window
+                .update(cx, |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                })
+                .unwrap();
+
+            let current_hue = handle
+                .current_style()
+                .unwrap()
+                .background
+                .unwrap()
+                .color()
+                .unwrap()
+                .solid
+                .h;
+            assert!(
+                current_hue <= previous_hue,
+                "re-anchored return ramp must be monotonic decreasing: prev {previous_hue}, current {current_hue}"
+            );
+            previous_hue = current_hue;
+        }
+
+        assert!(
+            (previous_hue - 0.0).abs() < 1e-3,
+            "settled back at start hue 0.0, got {previous_hue}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_style_transition_remount_preserves_state(cx: &mut TestAppContext) {
+        let handle = TransitionHandle::new();
+        let view_handle = handle.clone();
+
+        struct RemountTransitionView {
+            mounted: bool,
+            hovered: bool,
+            handle: TransitionHandle,
+        }
+
+        impl Render for RemountTransitionView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let handle = self.handle.clone();
+                let hovered = self.hovered;
+                div().when(self.mounted, |this| {
+                    let mut elem = div()
+                        .id("remount-box")
+                        .size(px(100.0))
+                        .transition(Duration::from_millis(100))
+                        .transition_handle(handle)
+                        .bg(crate::hsla(0.0, 1.0, 0.5, 1.0));
+                    if hovered {
+                        elem = elem.bg(crate::hsla(0.6, 1.0, 0.5, 1.0));
+                    }
+                    this.child(elem)
+                })
+            }
+        }
+
+        let window = cx.open_window(size(px(100.0), px(100.0)), move |_, _| {
+            RemountTransitionView {
+                mounted: true,
+                hovered: false,
+                handle: view_handle,
+            }
+        });
+        cx.run_until_parked();
+
+        // Start hover
+        window
+            .update(cx, |view, _, cx| {
+                view.hovered = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Advance 40ms into 100ms transition
+        cx.executor().advance_clock(Duration::from_millis(40));
+        window
+            .update(cx, |_, window, cx| {
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+
+        let hue_before_unmount = handle
+            .current_style()
+            .unwrap()
+            .background
+            .unwrap()
+            .color()
+            .unwrap()
+            .solid
+            .h;
+        assert!(
+            hue_before_unmount > 0.1 && hue_before_unmount < 0.5,
+            "mid-flight hue before unmount, got {hue_before_unmount}"
+        );
+
+        // Unmount element
+        window
+            .update(cx, |view, _, cx| {
+                view.mounted = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Remount element
+        window
+            .update(cx, |view, _, cx| {
+                view.mounted = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // On remount, transition state is preserved, not reset to 0.0
+        let hue_after_remount = handle
+            .current_style()
+            .unwrap()
+            .background
+            .unwrap()
+            .color()
+            .unwrap()
+            .solid
+            .h;
+        assert!(
+            (hue_after_remount - hue_before_unmount).abs() < 0.05,
+            "remount must preserve transition state, was {hue_before_unmount}, got {hue_after_remount}"
+        );
     }
 }
