@@ -475,6 +475,7 @@ pub struct SpringAnimation<T = ()> {
     pub(crate) epsilon: f32,
     pub(crate) initial: Option<f32>,
     pub(crate) playback: SpringPlayback,
+    pub(crate) handle: Option<crate::SpringHandle>,
 }
 
 impl SpringAnimation<()> {
@@ -486,6 +487,7 @@ impl SpringAnimation<()> {
             epsilon: DEFAULT_SPRING_EPSILON,
             initial: None,
             playback: SpringPlayback::Running,
+            handle: None,
         }
     }
 
@@ -497,6 +499,7 @@ impl SpringAnimation<()> {
             epsilon,
             initial,
             playback,
+            handle,
         } = self;
         SpringAnimation {
             config,
@@ -504,6 +507,7 @@ impl SpringAnimation<()> {
             epsilon,
             initial,
             playback,
+            handle,
         }
     }
 }
@@ -518,6 +522,12 @@ impl<T> SpringAnimation<T> {
     /// Sets how the spring advances or resolves its current value.
     pub fn playback(mut self, playback: SpringPlayback) -> Self {
         self.playback = playback;
+        self
+    }
+
+    /// Sets a stable handle that preserves spring position and velocity across element remounts.
+    pub fn with_handle(mut self, handle: crate::SpringHandle) -> Self {
+        self.handle = Some(handle);
         self
     }
 }

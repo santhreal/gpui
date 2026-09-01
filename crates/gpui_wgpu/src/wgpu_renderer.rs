@@ -1789,7 +1789,9 @@ impl WgpuRenderer {
                 })
                 .collect()
         } else {
-            let mut bounds = first_path.transformation.apply_to_bounds(first_path.clipped_bounds());
+            let mut bounds = first_path
+                .transformation
+                .apply_to_bounds(first_path.clipped_bounds());
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.transformation.apply_to_bounds(path.clipped_bounds()));
             }
@@ -1825,7 +1827,10 @@ impl WgpuRenderer {
     ) -> Result<bool> {
         let mut vertices = Vec::new();
         for path in paths {
-            let bounds = path.transformation.apply_to_bounds(path.bounds).intersect(&path.content_mask.bounds);
+            let bounds = path
+                .transformation
+                .apply_to_bounds(path.bounds)
+                .intersect(&path.content_mask.bounds);
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
@@ -2666,6 +2671,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn test_determinism_across_processes() {
         if std::env::var("P10_CHILD_DETERMINISM").is_ok() {
             let instance = WgpuContext::surfaceless_instance();
@@ -2815,11 +2821,28 @@ mod tests {
         };
         struct QuadView(bool);
         impl Render for QuadView {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 let quad = if self.0 {
-                    div().absolute().top(px(10.0)).left(px(10.0)).w(px(40.0)).h(px(40.0)).bg(rgb(0xff0000)).translate_x(px(50.0))
+                    div()
+                        .absolute()
+                        .top(px(10.0))
+                        .left(px(10.0))
+                        .w(px(40.0))
+                        .h(px(40.0))
+                        .bg(rgb(0xff0000))
+                        .translate_x(px(50.0))
                 } else {
-                    div().absolute().top(px(10.0)).left(px(10.0)).w(px(40.0)).h(px(40.0)).bg(rgb(0xff0000))
+                    div()
+                        .absolute()
+                        .top(px(10.0))
+                        .left(px(10.0))
+                        .w(px(40.0))
+                        .h(px(40.0))
+                        .bg(rgb(0xff0000))
                 };
                 div().size_full().child(quad)
             }
@@ -2827,11 +2850,28 @@ mod tests {
 
         struct ShadowView(bool);
         impl Render for ShadowView {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 let shadow = if self.0 {
-                    div().absolute().top(px(20.0)).left(px(20.0)).w(px(40.0)).h(px(40.0)).shadow_lg().translate_x(px(50.0))
+                    div()
+                        .absolute()
+                        .top(px(20.0))
+                        .left(px(20.0))
+                        .w(px(40.0))
+                        .h(px(40.0))
+                        .shadow_lg()
+                        .translate_x(px(50.0))
                 } else {
-                    div().absolute().top(px(20.0)).left(px(20.0)).w(px(40.0)).h(px(40.0)).shadow_lg()
+                    div()
+                        .absolute()
+                        .top(px(20.0))
+                        .left(px(20.0))
+                        .w(px(40.0))
+                        .h(px(40.0))
+                        .shadow_lg()
                 };
                 div().size_full().child(shadow)
             }
@@ -2839,11 +2879,26 @@ mod tests {
 
         struct TextView(bool);
         impl Render for TextView {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 let text = if self.0 {
-                    div().absolute().top(px(10.0)).left(px(10.0)).translate_y(px(30.0)).text_color(rgb(0xffffff)).child("Affine Transform")
+                    div()
+                        .absolute()
+                        .top(px(10.0))
+                        .left(px(10.0))
+                        .translate_y(px(30.0))
+                        .text_color(rgb(0xffffff))
+                        .child("Affine Transform")
                 } else {
-                    div().absolute().top(px(10.0)).left(px(10.0)).text_color(rgb(0xffffff)).child("Affine Transform")
+                    div()
+                        .absolute()
+                        .top(px(10.0))
+                        .left(px(10.0))
+                        .text_color(rgb(0xffffff))
+                        .child("Affine Transform")
                 };
                 div().size_full().child(text)
             }
@@ -2851,11 +2906,32 @@ mod tests {
 
         struct UnderlineView(bool);
         impl Render for UnderlineView {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 let underline = if self.0 {
-                    div().absolute().top(px(20.0)).left(px(10.0)).w(px(80.0)).h(px(20.0)).translate_y(px(30.0)).text_color(rgb(0xffffff)).underline().child("Underline")
+                    div()
+                        .absolute()
+                        .top(px(20.0))
+                        .left(px(10.0))
+                        .w(px(80.0))
+                        .h(px(20.0))
+                        .translate_y(px(30.0))
+                        .text_color(rgb(0xffffff))
+                        .underline()
+                        .child("Underline")
                 } else {
-                    div().absolute().top(px(20.0)).left(px(10.0)).w(px(80.0)).h(px(20.0)).text_color(rgb(0xffffff)).underline().child("Underline")
+                    div()
+                        .absolute()
+                        .top(px(20.0))
+                        .left(px(10.0))
+                        .w(px(80.0))
+                        .h(px(20.0))
+                        .text_color(rgb(0xffffff))
+                        .underline()
+                        .child("Underline")
                 };
                 div().size_full().child(underline)
             }
@@ -2866,9 +2942,12 @@ mod tests {
             let width = (160.0 * scale) as i32;
             let height = (100.0 * scale) as i32;
             let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), move || {
-                WgpuHeadlessRenderer::new(size(gpui::DevicePixels(width), gpui::DevicePixels(height)))
-                    .ok()
-                    .map(|r| Box::new(r) as Box<dyn PlatformHeadlessRenderer>)
+                WgpuHeadlessRenderer::new(size(
+                    gpui::DevicePixels(width),
+                    gpui::DevicePixels(height),
+                ))
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn PlatformHeadlessRenderer>)
             });
 
             // 1. Quad affine transform validation
@@ -2982,13 +3061,24 @@ mod tests {
         path_untrans.line_to(gpui::point(px(50.0), px(50.0)));
         path_untrans.line_to(gpui::point(px(10.0), px(50.0)));
         path_untrans.color = gpui::solid_background(rgb(0x00ff00));
-        path_untrans.bounds = gpui::Bounds::new(gpui::point(px(10.0), px(10.0)), gpui::size(px(40.0), px(40.0)));
-        path_untrans.content_mask = gpui::ContentMask { bounds: gpui::Bounds::new(gpui::point(px(0.0), px(0.0)), gpui::size(px(160.0), px(100.0))) };
+        path_untrans.bounds = gpui::Bounds::new(
+            gpui::point(px(10.0), px(10.0)),
+            gpui::size(px(40.0), px(40.0)),
+        );
+        path_untrans.content_mask = gpui::ContentMask {
+            bounds: gpui::Bounds::new(
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(160.0), px(100.0)),
+            ),
+        };
         scene_untrans.insert_primitive(path_untrans.scale(1.0));
 
         let mut scene_trans = Scene::default();
         let mut path_trans = path_untrans.scale(1.0);
-        path_trans.transformation = gpui::TransformationMatrix::unit().translate(gpui::point(gpui::ScaledPixels(50.0), gpui::ScaledPixels(0.0)));
+        path_trans.transformation = gpui::TransformationMatrix::unit().translate(gpui::point(
+            gpui::ScaledPixels(50.0),
+            gpui::ScaledPixels(0.0),
+        ));
         scene_trans.insert_primitive(path_trans);
         assert!(renderer.draw(&scene_untrans));
         let path_untrans_bytes = renderer.read_pixels().expect("read path untrans");
@@ -2996,8 +3086,7 @@ mod tests {
         let path_trans_bytes = renderer.read_pixels().expect("read path trans");
 
         assert_ne!(
-            path_untrans_bytes,
-            path_trans_bytes,
+            path_untrans_bytes, path_trans_bytes,
             "transformed path must differ from untransformed path"
         );
         assert!(
@@ -3010,8 +3099,16 @@ mod tests {
         underline_scene_untrans.insert_primitive(gpui::Underline {
             order: 0,
             pad: 0,
-            bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(10.0), gpui::ScaledPixels(20.0)), gpui::size(gpui::ScaledPixels(80.0), gpui::ScaledPixels(4.0))),
-            content_mask: gpui::ContentMask { bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(0.0)), gpui::size(gpui::ScaledPixels(160.0), gpui::ScaledPixels(100.0))) },
+            bounds: gpui::Bounds::new(
+                gpui::point(gpui::ScaledPixels(10.0), gpui::ScaledPixels(20.0)),
+                gpui::size(gpui::ScaledPixels(80.0), gpui::ScaledPixels(4.0)),
+            ),
+            content_mask: gpui::ContentMask {
+                bounds: gpui::Bounds::new(
+                    gpui::point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(0.0)),
+                    gpui::size(gpui::ScaledPixels(160.0), gpui::ScaledPixels(100.0)),
+                ),
+            },
             color: gpui::rgb(0xffffff).into(),
             thickness: gpui::ScaledPixels(2.0),
             wavy: false.into(),
@@ -3022,22 +3119,33 @@ mod tests {
         underline_scene_trans.insert_primitive(gpui::Underline {
             order: 0,
             pad: 0,
-            bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(10.0), gpui::ScaledPixels(20.0)), gpui::size(gpui::ScaledPixels(80.0), gpui::ScaledPixels(4.0))),
-            content_mask: gpui::ContentMask { bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(0.0)), gpui::size(gpui::ScaledPixels(160.0), gpui::ScaledPixels(100.0))) },
+            bounds: gpui::Bounds::new(
+                gpui::point(gpui::ScaledPixels(10.0), gpui::ScaledPixels(20.0)),
+                gpui::size(gpui::ScaledPixels(80.0), gpui::ScaledPixels(4.0)),
+            ),
+            content_mask: gpui::ContentMask {
+                bounds: gpui::Bounds::new(
+                    gpui::point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(0.0)),
+                    gpui::size(gpui::ScaledPixels(160.0), gpui::ScaledPixels(100.0)),
+                ),
+            },
             color: gpui::rgb(0xffffff).into(),
             thickness: gpui::ScaledPixels(2.0),
             wavy: false.into(),
-            transformation: gpui::TransformationMatrix::unit().translate(gpui::point(gpui::ScaledPixels(50.0), gpui::ScaledPixels(0.0))),
+            transformation: gpui::TransformationMatrix::unit().translate(gpui::point(
+                gpui::ScaledPixels(50.0),
+                gpui::ScaledPixels(0.0),
+            )),
         });
 
         assert!(renderer.draw(&underline_scene_untrans));
-        let direct_underline_untrans_bytes = renderer.read_pixels().expect("read underline untrans");
+        let direct_underline_untrans_bytes =
+            renderer.read_pixels().expect("read underline untrans");
         assert!(renderer.draw(&underline_scene_trans));
         let direct_underline_trans_bytes = renderer.read_pixels().expect("read underline trans");
 
         assert_ne!(
-            direct_underline_untrans_bytes,
-            direct_underline_trans_bytes,
+            direct_underline_untrans_bytes, direct_underline_trans_bytes,
             "transformed underline primitive must differ from untransformed underline primitive"
         );
     }

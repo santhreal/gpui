@@ -210,8 +210,6 @@ impl InteractiveElement for Svg {
     }
 }
 
-
-
 enum SvgAsset {}
 
 impl Asset for SvgAsset {

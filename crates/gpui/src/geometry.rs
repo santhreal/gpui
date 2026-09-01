@@ -389,7 +389,19 @@ impl<T: Clone + Debug + Default + PartialEq + Display> Display for Point<T> {
 /// This struct is generic over the type `T`, which can be any type that implements `Clone`, `Default`, and `Debug`.
 /// It is commonly used to specify dimensions for elements in a UI, such as a window or element.
 #[derive(
-    Add, Clone, Copy, Default, Deserialize, Div, Hash, Neg, PartialEq, Refineable, Serialize, Sub, JsonSchema,
+    Add,
+    Clone,
+    Copy,
+    Default,
+    Deserialize,
+    Div,
+    Hash,
+    Neg,
+    PartialEq,
+    Refineable,
+    Serialize,
+    Sub,
+    JsonSchema,
 )]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]

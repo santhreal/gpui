@@ -1,5 +1,9 @@
 use scheduler::Instant;
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 
 use crate::{
     AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
@@ -95,6 +99,27 @@ pub trait AnimationExt {
             element: Some(self),
             animator: Box::new(move |this, _, value| animator(this, value)),
             animations: smallvec::smallvec![animation],
+            handle: None,
+        }
+    }
+
+    /// Render this component or element with an animation bound to a stable handle.
+    fn with_animation_handle(
+        self,
+        id: impl Into<ElementId>,
+        animation: Animation,
+        handle: AnimationHandle,
+        animator: impl Fn(Self, f32) -> Self + 'static,
+    ) -> AnimationElement<Self>
+    where
+        Self: Sized,
+    {
+        AnimationElement {
+            id: id.into(),
+            element: Some(self),
+            animator: Box::new(move |this, _, value| animator(this, value)),
+            animations: smallvec::smallvec![animation],
+            handle: Some(handle),
         }
     }
 
@@ -113,6 +138,7 @@ pub trait AnimationExt {
             element: Some(self),
             animator: Box::new(animator),
             animations: animations.into(),
+            handle: None,
         }
     }
 
@@ -138,6 +164,7 @@ pub trait AnimationExt {
             epsilon,
             initial,
             playback,
+            handle,
         } = animation;
         let scalar_target = target.target();
         SpringAnimationElement {
@@ -151,7 +178,26 @@ pub trait AnimationExt {
             animator: Some(Box::new(move |this, value| {
                 animator(this, target.resolve(value))
             })),
+            handle,
         }
+    }
+
+    /// Renders this component or element at the value produced by a spring bound to a stable handle.
+    fn with_spring_handle<T>(
+        self,
+        id: impl Into<ElementId>,
+        animation: SpringAnimation<T>,
+        handle: SpringHandle,
+        animator: impl FnOnce(Self, T::Output) -> Self + 'static,
+    ) -> SpringAnimationElement<Self>
+    where
+        Self: Sized,
+        T: SpringTarget,
+        T::Output: 'static,
+    {
+        let mut elem = self.with_spring(id, animation, animator);
+        elem.handle = Some(handle);
+        elem
     }
 }
 
@@ -163,6 +209,67 @@ pub struct AnimationElement<E> {
     element: Option<E>,
     animations: SmallVec<[Animation; 1]>,
     animator: Box<dyn Fn(E, usize, f32) -> E + 'static>,
+    handle: Option<AnimationHandle>,
+}
+
+impl<E> AnimationElement<E> {
+    /// Binds a stable handle to this animation element to preserve state across remounts.
+    pub fn with_handle(mut self, handle: AnimationHandle) -> Self {
+        self.handle = Some(handle);
+        self
+    }
+}
+
+/// A stable handle that preserves duration-based animation state across element remounts.
+#[derive(Clone, Debug, Default)]
+pub struct AnimationHandle(pub(crate) Rc<RefCell<Option<AnimationState>>>);
+
+impl AnimationHandle {
+    /// Creates a new uninitialized animation handle.
+    pub fn new() -> Self {
+        Self(Rc::new(RefCell::new(None)))
+    }
+
+    /// Returns the normalized progress (0.0..=1.0) of the animation, if running.
+    pub fn progress(&self) -> Option<f32> {
+        self.0.borrow().as_ref().map(|s| s.progress)
+    }
+
+    /// Resets the animation handle state.
+    pub fn reset(&self) {
+        *self.0.borrow_mut() = None;
+    }
+}
+
+/// A stable handle that preserves spring animation state (position and velocity) across element remounts.
+#[derive(Clone, Debug, Default)]
+pub struct SpringHandle(pub(crate) Rc<RefCell<Option<SpringElementState>>>);
+
+impl SpringHandle {
+    /// Creates a new uninitialized spring handle.
+    pub fn new() -> Self {
+        Self(Rc::new(RefCell::new(None)))
+    }
+
+    /// Returns the current spring state (position and velocity), if initialized.
+    pub fn state(&self) -> Option<SpringState> {
+        self.0.borrow().as_ref().map(|s| s.spring)
+    }
+
+    /// Returns the current position of the spring.
+    pub fn position(&self) -> Option<f32> {
+        self.0.borrow().as_ref().map(|s| s.spring.position)
+    }
+
+    /// Returns the current velocity of the spring.
+    pub fn velocity(&self) -> Option<f32> {
+        self.0.borrow().as_ref().map(|s| s.spring.velocity)
+    }
+
+    /// Resets the spring handle state.
+    pub fn reset(&self) {
+        *self.0.borrow_mut() = None;
+    }
 }
 
 /// A GPUI element driven by a stateful spring.
@@ -175,6 +282,15 @@ pub struct SpringAnimationElement<E> {
     initial: Option<f32>,
     playback: SpringPlayback,
     animator: Option<Box<dyn FnOnce(E, f32) -> E + 'static>>,
+    handle: Option<SpringHandle>,
+}
+
+impl<E> SpringAnimationElement<E> {
+    /// Binds a stable handle to this spring animation element to preserve state across remounts.
+    pub fn with_handle(mut self, handle: SpringHandle) -> Self {
+        self.handle = Some(handle);
+        self
+    }
 }
 
 impl<E: ParentElement> ParentElement for SpringAnimationElement<E> {
@@ -231,21 +347,32 @@ impl<E: IntoElement + 'static> IntoElement for AnimationElement<E> {
     }
 }
 
-struct AnimationState {
+/// The persistent state of an animation element.
+#[derive(Clone, Debug)]
+pub struct AnimationState {
     start: Instant,
     animation_ix: usize,
+    progress: f32,
     /// Whether a throttled re-render (see [`Animation::with_max_fps`]) is
     /// already scheduled, so overlapping renders don't stack extra timers.
     delayed_frame_pending: Rc<Cell<bool>>,
 }
 
-struct SpringElementState {
-    spring: SpringState,
-    target: f32,
-    config: SpringConfig,
-    initial: f32,
-    playback: SpringPlayback,
-    updated_at: Instant,
+/// The persistent state of a spring animation element.
+#[derive(Clone, Debug)]
+pub struct SpringElementState {
+    /// Current position and velocity of the spring.
+    pub spring: SpringState,
+    /// Target value the spring is moving toward.
+    pub target: f32,
+    /// Spring configuration parameters.
+    pub config: SpringConfig,
+    /// Initial value of the spring.
+    pub initial: f32,
+    /// Playback mode of the spring.
+    pub playback: SpringPlayback,
+    /// Timestamp when the spring was last updated.
+    pub updated_at: Instant,
 }
 
 impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
@@ -268,21 +395,25 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
-            let now = Instant::now();
+            let now = cx.background_executor().now();
             let initial = self.initial.unwrap_or(self.target);
-            let mut state = state.unwrap_or_else(|| SpringElementState {
-                spring: SpringState {
-                    position: initial,
-                    velocity: 0.0,
-                },
-                target: self.target,
-                config: self.config,
-                initial,
-                playback: self.playback,
-                updated_at: now,
-            });
+            let mut state: SpringElementState = state
+                .or_else(|| self.handle.as_ref().and_then(|h| h.0.borrow().clone()))
+                .unwrap_or_else(|| SpringElementState {
+                    spring: SpringState {
+                        position: initial,
+                        velocity: 0.0,
+                    },
+                    target: self.target,
+                    config: self.config,
+                    initial,
+                    playback: self.playback,
+                    updated_at: now,
+                });
 
-            let elapsed = now.duration_since(state.updated_at).as_secs_f32();
+            let elapsed = now
+                .saturating_duration_since(state.updated_at)
+                .as_secs_f32();
             match state.playback {
                 SpringPlayback::Running => {
                     state.spring = state.config.step(state.spring, state.target, elapsed);
@@ -341,6 +472,9 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
             state.playback = self.playback;
             state.updated_at = now;
 
+            if let Some(handle) = &self.handle {
+                *handle.0.borrow_mut() = Some(state.clone());
+            }
             let element = self.element.take().expect("should only be called once");
             let animator = self.animator.take().expect("should only be called once");
             let mut element = animator(element, state.spring.position).into_any_element();
@@ -399,11 +533,15 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
-            let mut state = state.unwrap_or_else(|| AnimationState {
-                start: Instant::now(),
-                animation_ix: 0,
-                delayed_frame_pending: Rc::new(Cell::new(false)),
-            });
+            let now = cx.background_executor().now();
+            let mut state: AnimationState = state
+                .or_else(|| self.handle.as_ref().and_then(|h| h.0.borrow().clone()))
+                .unwrap_or_else(|| AnimationState {
+                    start: now,
+                    animation_ix: 0,
+                    progress: 0.0,
+                    delayed_frame_pending: Rc::new(Cell::new(false)),
+                });
             let (animation_ix, delta, done) = if cx.reduce_motion() {
                 let animation_ix = self.animations.len() - 1;
                 let delta = if self.animations[animation_ix].oneshot {
@@ -417,11 +555,11 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                 let duration = self.animations[animation_ix].duration;
 
                 let elapsed = if self.animations[animation_ix].synced && !duration.is_zero() {
-                    let elapsed = cx.background_executor().now() - cx.synced_animation_epoch;
+                    let elapsed = now - cx.synced_animation_epoch;
                     // Reduce modulo the duration before f32 conversion, which loses sub-second precision at scale.
                     Duration::from_nanos((elapsed.as_nanos() % duration.as_nanos()) as u64)
                 } else {
-                    state.start.elapsed()
+                    now.saturating_duration_since(state.start)
                 };
                 let mut delta = elapsed.as_secs_f32() / duration.as_secs_f32();
 
@@ -431,7 +569,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                         if animation_ix >= self.animations.len() - 1 {
                             done = true;
                         } else {
-                            state.start = Instant::now();
+                            state.start = now;
                             state.animation_ix += 1;
                         }
                         delta = 1.0;
@@ -441,6 +579,10 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                 }
                 (animation_ix, delta, done)
             };
+            state.progress = delta;
+            if let Some(handle) = &self.handle {
+                *handle.0.borrow_mut() = Some(state.clone());
+            }
             let delta = (self.animations[animation_ix].easing)(delta);
 
             debug_assert!(delta.is_finite(), "animated value should be finite");
@@ -1024,5 +1166,167 @@ mod tests {
 
         assert_eq!(simulate_next_frame(&window, cx), 0);
         assert_eq!(*rendered_deltas.borrow(), vec![0.0]);
+    }
+    #[gpui::test]
+    fn test_spring_interrupted_at_40_percent_reverses_with_nonzero_velocity(
+        cx: &mut TestAppContext,
+    ) {
+        let handle = SpringHandle::new();
+        let rendered_values = Rc::new(RefCell::new(Vec::new()));
+
+        struct InterruptedSpringView {
+            target: Pixels,
+            handle: SpringHandle,
+            rendered_values: Rc<RefCell<Vec<Pixels>>>,
+        }
+
+        impl Render for InterruptedSpringView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let rendered = self.rendered_values.clone();
+                let animation = SpringAnimation::new(SpringConfig::new(100.0, 5.0, 1.0))
+                    .to(self.target)
+                    .from(px(0.0))
+                    .with_handle(self.handle.clone());
+                div().with_spring("spring", animation, move |this, val| {
+                    rendered.borrow_mut().push(val);
+                    this.left(val)
+                })
+            }
+        }
+
+        let window = cx.open_window(size(px(100.0), px(100.0)), {
+            let handle = handle.clone();
+            move |_, _| InterruptedSpringView {
+                target: px(100.0),
+                handle,
+                rendered_values,
+            }
+        });
+        cx.run_until_parked();
+
+        // Advance until the spring reaches approximately 40% (40.0 px)
+        while handle.position().unwrap_or(0.0) < 40.0 {
+            cx.executor().advance_clock(Duration::from_millis(10));
+            simulate_next_frame(&window, cx);
+        }
+
+        let pos_at_interrupt = handle.position().unwrap();
+        let vel_at_interrupt = handle.velocity().unwrap();
+        assert!(pos_at_interrupt >= 40.0 && pos_at_interrupt < 60.0);
+        assert!(
+            vel_at_interrupt > 0.0,
+            "velocity must be positive moving forward"
+        );
+
+        // Interrupt by reversing target back to 0.0
+        window
+            .update(cx, |view, _, cx| {
+                view.target = px(0.0);
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Check that non-zero forward velocity is retained on reversal
+        let vel_after_reversal = handle.velocity().unwrap();
+        assert!(vel_after_reversal > 0.0, "velocity must remain non-zero on interruption");
+
+        // Step a small delta; forward inertia carries it strictly past the interruption point
+        cx.executor().advance_clock(Duration::from_millis(5));
+        simulate_next_frame(&window, cx);
+        let pos_stepped = handle.position().unwrap();
+        assert!(
+            pos_stepped > pos_at_interrupt,
+            "forward velocity carries it strictly forward past interruption point"
+        );
+        // Let it run to settling at 0.0
+        for _ in 0..150 {
+            cx.executor().advance_clock(Duration::from_millis(20));
+            simulate_next_frame(&window, cx);
+        }
+        assert!((handle.position().unwrap() - 0.0).abs() < 1.0);
+    }
+
+    #[gpui::test]
+    fn test_animation_remount_mid_flight_does_not_reset_progress(cx: &mut TestAppContext) {
+        let handle = AnimationHandle::new();
+        let rendered_deltas = Rc::new(RefCell::new(Vec::new()));
+
+        struct RemountAnimationView {
+            mounted: bool,
+            handle: AnimationHandle,
+            rendered_deltas: Rc<RefCell<Vec<f32>>>,
+        }
+
+        impl Render for RemountAnimationView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let deltas = self.rendered_deltas.clone();
+                let handle = self.handle.clone();
+                div().when(self.mounted, |this| {
+                    this.child(div().with_animation_handle(
+                        "anim",
+                        Animation::new(Duration::from_secs(1)),
+                        handle,
+                        move |child, delta| {
+                            deltas.borrow_mut().push(delta);
+                            child
+                        },
+                    ))
+                })
+            }
+        }
+
+        let window = cx.open_window(size(px(100.0), px(100.0)), {
+            let handle = handle.clone();
+            move |_, _| RemountAnimationView {
+                mounted: true,
+                handle,
+                rendered_deltas,
+            }
+        });
+        cx.run_until_parked();
+
+        // Advance clock by 400ms (40% of 1 second animation)
+        cx.executor().advance_clock(Duration::from_millis(400));
+        simulate_next_frame(&window, cx);
+
+        let progress_before_unmount = handle.progress().unwrap();
+        assert!(
+            (progress_before_unmount - 0.4).abs() < 0.05,
+            "progress should be around 0.4, got {progress_before_unmount}"
+        );
+
+        // Unmount element
+        window
+            .update(cx, |view, _, cx| {
+                view.mounted = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Remount element
+        window
+            .update(cx, |view, _, cx| {
+                view.mounted = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // On remount, progress is retained from the handle, NOT reset to 0.0
+        let progress_after_remount = handle.progress().unwrap();
+        assert!(
+            progress_after_remount >= progress_before_unmount,
+            "remount must not reset progress to 0, was {progress_before_unmount}, got {progress_after_remount}"
+        );
     }
 }
