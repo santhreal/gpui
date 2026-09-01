@@ -489,7 +489,7 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
             let mut element = animator(element, state.spring.position).into_any_element();
 
             if !done {
-                window.request_animation_frame();
+                window.request_animation_frame_at_paint();
             }
 
             ((element.request_layout(window, cx), element), state)
@@ -512,13 +512,14 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: crate::Bounds<crate::Pixels>,
+        bounds: crate::Bounds<crate::Pixels>,
         element: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.invalidate_damage(_bounds);
+        // The frame this element requests repaints only what it declares.
+        window.declare_damage(bounds);
         element.paint(window, cx);
     }
 }
@@ -640,12 +641,13 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                                 .spawn(cx, async move |cx| {
                                     cx.background_executor().timer(interval).await;
                                     delayed_frame_pending.set(false);
-                                    cx.update(move |_, cx| cx.notify(view)).ok();
+                                    cx.update(move |window, cx| window.notify_at_paint(view, cx))
+                                        .ok();
                                 })
                                 .detach();
                         }
                     }
-                    _ => window.request_animation_frame(),
+                    _ => window.request_animation_frame_at_paint(),
                 }
             }
 
@@ -669,13 +671,14 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: crate::Bounds<crate::Pixels>,
+        bounds: crate::Bounds<crate::Pixels>,
         element: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.invalidate_damage(_bounds);
+        // The frame this element requests repaints only what it declares.
+        window.declare_damage(bounds);
         element.paint(window, cx);
     }
 }

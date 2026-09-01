@@ -47,7 +47,7 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::{Cell, RefCell, RefMut},
     cmp,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
@@ -125,9 +125,22 @@ struct WindowInvalidatorInner {
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
-    pub damage_rects: Vec<Bounds<Pixels>>,
+    /// Damage declared since the last draw, for the next frame.
+    pub declared_damage: Vec<Bounds<Pixels>>,
+    /// Damage declared while painting the frame being drawn. An element that
+    /// declares its bounds every paint is one that changes every frame, so
+    /// these rects also cover the frame after this one: that is where the
+    /// pixels it painted this frame get replaced.
+    pub painted_damage: Vec<Bounds<Pixels>>,
+    /// `painted_damage` of the previous draw, carried into this one.
+    pub carried_damage: Vec<Bounds<Pixels>>,
+    /// An invalidation arrived that declared no bounds, so the next frame
+    /// repaints the whole viewport.
+    pub undeclared: bool,
+    /// Like `undeclared`, but raised during a draw: it applies to the frame
+    /// after the one being drawn, which is where that view re-renders.
+    pub undeclared_after_draw: bool,
     pub last_frame_damage: Option<Bounds<Pixels>>,
-    pub full_invalidation: bool,
     #[cfg(feature = "profiler")]
     pub frame_dirty: FrameDirtyAccumulator,
     pub platform_waker: Option<Rc<dyn Fn()>>,
@@ -160,9 +173,12 @@ impl WindowInvalidator {
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
-                damage_rects: Vec::new(),
+                declared_damage: Vec::new(),
+                painted_damage: Vec::new(),
+                carried_damage: Vec::new(),
+                undeclared: true,
+                undeclared_after_draw: false,
                 last_frame_damage: None,
-                full_invalidation: true,
                 #[cfg(feature = "profiler")]
                 frame_dirty: FrameDirtyAccumulator::default(),
                 platform_waker: None,
@@ -172,9 +188,44 @@ impl WindowInvalidator {
 
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
+        if inner.draw_phase == DrawPhase::None {
+            inner.undeclared = true;
+        } else {
+            inner.undeclared_after_draw = true;
+        }
+        Self::mark_view(inner, entity, cx)
+    }
+
+    /// Marks `entity` dirty like `invalidate_view`, declaring that its next
+    /// render changes pixels only inside `bounds`. Anything the view paints
+    /// outside `bounds` keeps the previous frame's pixels.
+    pub fn invalidate_view_within(
+        &self,
+        entity: EntityId,
+        bounds: Bounds<Pixels>,
+        cx: &mut App,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        Self::push_damage(&mut inner, bounds);
+        Self::mark_view(inner, entity, cx)
+    }
+
+    /// Marks `entity` dirty like `invalidate_view` without declaring bounds
+    /// here: the damage is what the entity's elements declared while painting
+    /// the previous frame plus what they declare while painting the next one.
+    /// For an element that declares its bounds on every paint, that is where
+    /// it was and where it will be.
+    pub fn invalidate_view_at_paint(&self, entity: EntityId, cx: &mut App) -> bool {
+        Self::mark_view(self.inner.borrow_mut(), entity, cx)
+    }
+
+    fn mark_view(
+        mut inner: RefMut<'_, WindowInvalidatorInner>,
+        entity: EntityId,
+        cx: &mut App,
+    ) -> bool {
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
-        inner.full_invalidation = true;
         if inner.draw_phase == DrawPhase::None {
             #[cfg(feature = "profiler")]
             let dirty_at = Self::record_frame_dirty(&mut inner);
@@ -198,65 +249,80 @@ impl WindowInvalidator {
         }
     }
 
-    pub fn invalidate_damage(&self, bounds: Bounds<Pixels>) -> bool {
-        let mut inner = self.inner.borrow_mut();
-        inner.update_count += 1;
-        inner.damage_rects.push(bounds);
+    fn push_damage(inner: &mut WindowInvalidatorInner, bounds: Bounds<Pixels>) {
         if inner.draw_phase == DrawPhase::None {
-            #[cfg(feature = "profiler")]
-            let dirty_at = Self::record_frame_dirty(&mut inner);
-            let became_dirty = !inner.dirty;
-            inner.dirty = true;
-            let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
-            #[cfg(feature = "profiler")]
-            let window_id = inner.window_id;
-            drop(inner);
-            #[cfg(feature = "profiler")]
-            if became_dirty {
-                profiler::journal::record_frame_pending(window_id, dirty_at);
-            }
-            if let Some(waker) = waker {
-                waker();
-            }
-            true
+            inner.declared_damage.push(bounds);
         } else {
-            false
+            inner.painted_damage.push(bounds);
         }
     }
 
+    /// Declares that pixels inside `bounds` change, without marking a view
+    /// dirty. Outside a draw this schedules a frame; inside a draw it records
+    /// the bounds of what is being painted, for this frame and the next.
+    pub fn declare_damage(&self, bounds: Bounds<Pixels>) {
+        let mut inner = self.inner.borrow_mut();
+        Self::push_damage(&mut inner, bounds);
+        if inner.draw_phase != DrawPhase::None {
+            return;
+        }
+        inner.update_count += 1;
+        #[cfg(feature = "profiler")]
+        let dirty_at = Self::record_frame_dirty(&mut inner);
+        let became_dirty = !inner.dirty;
+        inner.dirty = true;
+        let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+        #[cfg(feature = "profiler")]
+        let window_id = inner.window_id;
+        drop(inner);
+        #[cfg(feature = "profiler")]
+        if became_dirty {
+            profiler::journal::record_frame_pending(window_id, dirty_at);
+        }
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    /// Resolves the damage of the frame just painted: `None` for the whole
+    /// viewport, otherwise the union of every declared rect clipped to the
+    /// viewport. Called once per draw, after paint, so the rects painted
+    /// elements declared this frame are included; those rects then carry into
+    /// the next frame.
     pub fn take_damage(&self, viewport: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
         let mut inner = self.inner.borrow_mut();
-        let damage = if inner.full_invalidation || inner.damage_rects.is_empty() {
-            Some(viewport)
-        } else {
-            let mut union_bounds = inner.damage_rects[0];
-            for r in &inner.damage_rects[1..] {
-                union_bounds = union_bounds.union(r);
-            }
-            Some(union_bounds.intersect(&viewport))
-        };
+        let damage = Self::union_damage(&inner).map(|union| union.intersect(&viewport));
+        inner.undeclared = mem::take(&mut inner.undeclared_after_draw);
+        inner.declared_damage.clear();
+        let painted = mem::take(&mut inner.painted_damage);
+        inner.carried_damage = painted;
         inner.last_frame_damage = damage;
-        inner.damage_rects.clear();
-        inner.full_invalidation = false;
         damage
     }
 
-    pub fn accumulated_damage(&self) -> Option<Bounds<Pixels>> {
-        let inner = self.inner.borrow();
-        if inner.damage_rects.is_empty() {
-            inner.last_frame_damage
-        } else {
-            let mut union_bounds = inner.damage_rects[0];
-            for r in &inner.damage_rects[1..] {
-                union_bounds = union_bounds.union(r);
-            }
-            Some(union_bounds)
+    /// The damage the next draw would resolve to right now: `None` for the
+    /// whole viewport, an empty rect when nothing is pending.
+    pub fn pending_damage(&self) -> Option<Bounds<Pixels>> {
+        Self::union_damage(&self.inner.borrow())
+    }
+
+    fn union_damage(inner: &WindowInvalidatorInner) -> Option<Bounds<Pixels>> {
+        if inner.undeclared {
+            return None;
         }
+        let mut rects = inner
+            .declared_damage
+            .iter()
+            .chain(&inner.carried_damage)
+            .chain(&inner.painted_damage);
+        let first = rects.next().copied().unwrap_or_default();
+        Some(rects.fold(first, |union, rect| union.union(rect)))
     }
 
     pub fn last_frame_damage(&self) -> Option<Bounds<Pixels>> {
         self.inner.borrow().last_frame_damage
     }
+
     pub fn is_dirty(&self) -> bool {
         self.inner.borrow().dirty
     }
@@ -267,7 +333,7 @@ impl WindowInvalidator {
         inner.dirty = dirty;
         if dirty {
             inner.update_count += 1;
-            inner.full_invalidation = true;
+            inner.undeclared = true;
         }
         #[cfg(feature = "profiler")]
         let dirty_at = dirty.then(|| Self::record_frame_dirty(&mut inner));
@@ -1999,27 +2065,114 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// The corner radii for rounded clipping
+    pub corner_radii: Corners<P>,
+}
+
+impl<P: Clone + Debug + Default + PartialEq> From<Bounds<P>> for ContentMask<P> {
+    fn from(bounds: Bounds<P>) -> Self {
+        Self {
+            bounds,
+            corner_radii: Corners::default(),
+        }
+    }
 }
 
 impl ContentMask<Pixels> {
+    /// Create a rectangular content mask with no corner rounding.
+    pub fn from_bounds(bounds: Bounds<Pixels>) -> Self {
+        Self {
+            bounds,
+            corner_radii: Corners::default(),
+        }
+    }
+
     /// Scale the content mask's pixel units by the given scaling factor.
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
+    ///
+    /// For nested rounded clips, the intersection takes the intersected bounds
+    /// and the inner mask's corner radii clamped to the resulting bounds dimensions.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        if bounds.is_empty() {
+            return Self {
+                bounds,
+                corner_radii: Corners::default(),
+            };
+        }
+
+        let corner_radii = if self.bounds == bounds && other.bounds != bounds {
+            self.corner_radii
+        } else if other.bounds == bounds && self.bounds != bounds {
+            other.corner_radii
+        } else if self.corner_radii != Corners::default() {
+            self.corner_radii
+        } else {
+            other.corner_radii
+        };
+
+        let max_radius_x = bounds.size.width / 2.0;
+        let max_radius_y = bounds.size.height / 2.0;
+        let max_radius = max_radius_x.min(max_radius_y);
+        let corner_radii = Corners {
+            top_left: corner_radii.top_left.min(max_radius).max(px(0.0)),
+            top_right: corner_radii.top_right.min(max_radius).max(px(0.0)),
+            bottom_right: corner_radii.bottom_right.min(max_radius).max(px(0.0)),
+            bottom_left: corner_radii.bottom_left.min(max_radius).max(px(0.0)),
+        };
+
+        ContentMask { bounds, corner_radii }
+    }
+}
+
+impl ContentMask<ScaledPixels> {
+    /// Intersect the content mask with the given content mask.
+    pub fn intersect(&self, other: &Self) -> Self {
+        let bounds = self.bounds.intersect(&other.bounds);
+        if bounds.is_empty() {
+            return Self {
+                bounds,
+                corner_radii: Corners::default(),
+            };
+        }
+
+        let corner_radii = if self.bounds == bounds && other.bounds != bounds {
+            self.corner_radii
+        } else if other.bounds == bounds && self.bounds != bounds {
+            other.corner_radii
+        } else if self.corner_radii != Corners::default() {
+            self.corner_radii
+        } else {
+            other.corner_radii
+        };
+
+        let max_radius_x = bounds.size.width / 2.0;
+        let max_radius_y = bounds.size.height / 2.0;
+        let max_radius = max_radius_x.min(max_radius_y);
+        let corner_radii = Corners {
+            top_left: corner_radii.top_left.min(max_radius).max(ScaledPixels(0.0)),
+            top_right: corner_radii.top_right.min(max_radius).max(ScaledPixels(0.0)),
+            bottom_right: corner_radii.bottom_right.min(max_radius).max(ScaledPixels(0.0)),
+            bottom_left: corner_radii.bottom_left.min(max_radius).max(ScaledPixels(0.0)),
+        };
+
+        Self {
+            bounds,
+            corner_radii,
+        }
     }
 }
 
@@ -2108,22 +2261,28 @@ impl Window {
         }
     }
 
-    /// Invalidate only the specified damage rectangle rather than the whole window.
-    pub fn invalidate_damage(&mut self, bounds: Bounds<Pixels>) {
-        self.invalidator.invalidate_damage(bounds);
+    /// Declares that pixels inside `bounds` (window coordinates) change.
+    ///
+    /// Called outside a draw, it schedules a frame that repaints only the
+    /// declared damage, unless a whole-window invalidation such as
+    /// [`Window::refresh`] or an unscoped notify is also pending. Called from
+    /// an element's `paint`, it records the bounds the element painted so the
+    /// next frame repaints them: an element that animates declares its bounds
+    /// on every paint, and [`Window::request_animation_frame_at_paint`]
+    /// scopes the frame it requests to those bounds.
+    pub fn declare_damage(&mut self, bounds: Bounds<Pixels>) {
+        self.invalidator.declare_damage(bounds);
     }
 
-    /// Feed an explicit damage rectangle into the window invalidator.
-    pub fn damage(&mut self, bounds: Bounds<Pixels>) {
-        self.invalidate_damage(bounds);
+    /// The damage the next draw resolves to right now: `None` for the whole
+    /// viewport, otherwise the union of the declared rects in window
+    /// coordinates, empty when nothing is pending.
+    pub fn pending_damage(&self) -> Option<Bounds<Pixels>> {
+        self.invalidator.pending_damage()
     }
 
-    /// Returns the accumulated damage rectangle for the upcoming or most recent frame.
-    pub fn accumulated_damage(&self) -> Option<Bounds<Pixels>> {
-        self.invalidator.accumulated_damage()
-    }
-
-    /// Returns the damage rectangle of the last rendered frame.
+    /// The damage of the last drawn frame: `None` when it repainted the whole
+    /// viewport, otherwise the region it repainted in window coordinates.
     pub fn last_frame_damage(&self) -> Option<Bounds<Pixels>> {
         self.invalidator.last_frame_damage()
     }
@@ -2470,6 +2629,24 @@ impl Window {
     pub fn request_animation_frame(&self) {
         let entity = self.current_view();
         self.on_next_frame(move |_, cx| cx.notify(entity));
+    }
+
+    /// Like [`Window::request_animation_frame`], but the frame repaints only
+    /// what the current view's elements declare with
+    /// [`Window::declare_damage`] during paint: the bounds they painted this
+    /// frame and the bounds they paint next frame. The rest of the window
+    /// keeps its pixels, so an element that requests frames this way must
+    /// declare every region its animation changes.
+    pub fn request_animation_frame_at_paint(&self) {
+        let entity = self.current_view();
+        self.on_next_frame(move |window, cx| window.notify_at_paint(entity, cx));
+    }
+
+    /// Marks `entity` dirty in this window like [`App::notify`], with the
+    /// damage scoped to what its elements declare during paint; see
+    /// [`Window::request_animation_frame_at_paint`].
+    pub fn notify_at_paint(&mut self, entity: EntityId, cx: &mut App) {
+        self.invalidator.invalidate_view_at_paint(entity, cx);
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
@@ -2881,8 +3058,10 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+        let mask = self.content_mask();
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_bounds(mask.bounds),
+            corner_radii: mask.corner_radii.scale(self.scale_factor()),
         }
     }
 
@@ -2974,10 +3153,6 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
-        let damage = self
-            .invalidator
-            .take_damage(Bounds::new(Point::default(), self.viewport_size));
-        self.next_frame.scene.damage = damage.map(|d| d.scale(self.scale_factor()));
         self.requested_autoscroll = None;
 
         // Restore the previously-used input handler.
@@ -3011,6 +3186,12 @@ impl Window {
             }
         }
         self.dirty_views.clear();
+        // Resolved after paint so the bounds elements declared while painting
+        // this frame are part of it, and carry into the next one.
+        let damage = self
+            .invalidator
+            .take_damage(Bounds::new(Point::default(), self.viewport_size));
+        self.next_frame.scene.damage = damage.map(|damage| damage.scale(self.scale_factor()));
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
@@ -3681,6 +3862,52 @@ impl Window {
         }
     }
 
+    /// Invoke the given function with a rounded content mask after intersecting it
+    /// with the current mask. This method should only be called during element drawing.
+    #[inline]
+    pub fn with_rounded_clip<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_content_mask(
+            Some(ContentMask {
+                bounds,
+                corner_radii,
+            }),
+            f,
+        )
+    }
+
+    /// Invoke the given function with an arbitrary path clip. Subtree primitives
+    /// are drawn into an intermediate target and composited onto the frame
+    /// multiplied by the path coverage.
+    pub fn with_clip_path<R>(
+        &mut self,
+        mut path: Path<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        path.content_mask = content_mask;
+        path.color = crate::white().into();
+        path.transformation = self.transformation;
+
+        let scaled_path = path.scale(scale_factor);
+        let clipped_bounds = scaled_path.clipped_bounds();
+        if clipped_bounds.is_empty() {
+            return f(self);
+        }
+
+        self.next_frame.scene.push_path_clip(scaled_path);
+        let result = f(self);
+        self.next_frame.scene.pop_path_clip();
+        result
+    }
+
     /// Updates the global element offset relative to the current offset. This is used to implement
     /// scrolling. This method should only be called during the prepaint phase of element drawing.
     pub fn with_element_offset<R>(
@@ -3865,6 +4092,7 @@ impl Window {
                     origin: Point::default(),
                     size: self.viewport_size,
                 },
+                corner_radii: Corners::default(),
             })
     }
 
@@ -4333,6 +4561,7 @@ impl Window {
                 self.next_frame.scene.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
+                        corner_radii: quad.content_mask.corner_radii,
                     },
                     ..quad
                 });
@@ -7871,126 +8100,284 @@ mod tests {
         assert_eq!(b_focus_count.get(), 1);
     }
 
-    struct TranscriptView;
+    /// WHY: P5 repaints only the region a frame declares. These tests pin
+    /// the invariant at its choke point, `WindowInvalidator`, through the real
+    /// draw path: every unscoped invalidation (`notify`, `refresh`, a resize,
+    /// a notify raised while drawing) resolves to a whole-viewport frame, and
+    /// every scoped one (`declare_damage`, `notify_within`, an animation
+    /// element's paint) resolves to exactly the union of what was declared,
+    /// clipped to the viewport. They do not cover what the renderer does with
+    /// the rect; `gpui_wgpu` proves the retained-texture blit separately.
+    mod damage {
+        use super::*;
+        use crate::{AnimationExt, Bounds, Context, Pixels, Render, Window, div, point, px, size};
+        use std::{cell::Cell, rc::Rc, time::Duration};
 
-    impl Render for TranscriptView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .child(
-                    div()
-                        .id("entry-1")
-                        .w(px(200.0))
-                        .h(px(50.0))
-                        .bg(crate::black()),
-                )
-                .child(
-                    div()
-                        .id("entry-2")
-                        .w(px(200.0))
-                        .h(px(50.0))
-                        .bg(crate::black()),
-                )
-        }
-    }
+        struct Entries;
 
-    #[gpui::test]
-    fn test_damage_scoped_invalidation_contained_in_entry_box(cx: &mut TestAppContext) {
-        let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| TranscriptView);
-        cx.run_until_parked();
-
-        // Simulate TranscriptUpdated for entry-2: damage is fed for entry-2 box at (0, 50, 200, 50)
-        let entry_2_box = Bounds {
-            origin: point(px(0.0), px(50.0)),
-            size: size(px(200.0), px(50.0)),
-        };
-
-        window
-            .update(cx, |_, window, _| {
-                window.invalidate_damage(entry_2_box);
-            })
-            .unwrap();
-
-        let accumulated = window
-            .update(cx, |_, window, _| window.accumulated_damage())
-            .unwrap()
-            .expect("should have accumulated damage");
-
-        assert!(
-            accumulated.origin.x >= entry_2_box.origin.x
-                && accumulated.origin.y >= entry_2_box.origin.y
-                && accumulated.right() <= entry_2_box.right()
-                && accumulated.bottom() <= entry_2_box.bottom(),
-            "damage rect must be contained in entry box: damage {:?}, box {:?}",
-            accumulated,
-            entry_2_box
-        );
-
-        // Draw frame and verify last frame damage was contained in entry_2_box
-        window
-            .update(cx, |_, window, cx| {
-                window.simulate_next_frame(cx);
-            })
-            .unwrap();
-
-        let frame_damage = window
-            .update(cx, |_, window, _| window.last_frame_damage())
-            .unwrap()
-            .expect("should record last frame damage");
-
-        assert_eq!(frame_damage, entry_2_box);
-    }
-
-    #[gpui::test]
-    fn test_mounted_animation_damage_contained_in_bounds(cx: &mut TestAppContext) {
-        use crate::AnimationExt;
-        use std::time::Duration;
-
-        struct SpinnerView;
-
-        impl Render for SpinnerView {
-            fn render(
-                &mut self,
-                _window: &mut Window,
-                _cx: &mut Context<Self>,
-            ) -> impl IntoElement {
+        impl Render for Entries {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 div()
-                    .size(px(400.0))
-                    .child(div().w(px(58.0)).h(px(20.0)).with_animation(
-                        "spin",
-                        crate::Animation::new(Duration::from_millis(500)).repeat(),
-                        |el, delta| el.opacity(delta),
-                    ))
+                    .size_full()
+                    .child(div().w(px(200.0)).h(px(50.0)).bg(crate::black()))
+                    .child(div().w(px(200.0)).h(px(50.0)).bg(crate::black()))
             }
         }
 
-        let window = cx.open_window(size(px(400.0), px(400.0)), |_, _| SpinnerView);
-        cx.run_until_parked();
+        fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+            Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+        }
 
-        // Advance animation clock to trigger a frame
-        cx.executor().advance_clock(Duration::from_millis(50));
-        window
-            .update(cx, |_, window, cx| {
-                window.simulate_next_frame(cx);
-            })
-            .unwrap();
+        fn last_frame_damage(
+            window: &AnyWindowHandle,
+            cx: &mut TestAppContext,
+        ) -> Option<Bounds<Pixels>> {
+            window
+                .update(cx, |_, window, _| window.last_frame_damage())
+                .unwrap()
+        }
 
-        // The animation paint invalidated its own bounds (58 x 20)
-        let accumulated = window
-            .update(cx, |_, window, _| window.accumulated_damage())
-            .unwrap()
-            .expect("spinner animation should have accumulated damage");
+        #[gpui::test]
+        fn the_first_frame_and_every_unscoped_invalidation_repaint_the_viewport(
+            cx: &mut TestAppContext,
+        ) {
+            let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| Entries);
+            cx.run_until_parked();
+            assert_eq!(last_frame_damage(&window, cx), None, "first frame");
 
-        let spinner_bounds = Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(58.0), px(20.0)),
-        };
+            window
+                .update(cx, |_, window, _| {
+                    window.declare_damage(bounds(0.0, 50.0, 200.0, 50.0));
+                    window.refresh();
+                })
+                .unwrap();
+            assert_eq!(last_frame_damage(&window, cx), None, "refresh beside a declaration");
 
-        assert!(
-            accumulated.size.width <= spinner_bounds.size.width
-                && accumulated.size.height <= spinner_bounds.size.height,
-            "mounted spinner damage must be contained within its bounds, got {:?}",
-            accumulated
-        );
+            window
+                .update(cx, |_, window, cx| {
+                    window.declare_damage(bounds(0.0, 50.0, 200.0, 50.0));
+                    cx.notify();
+                })
+                .unwrap();
+            assert_eq!(last_frame_damage(&window, cx), None, "notify beside a declaration");
+
+            window
+                .update(cx, |_, window, _| {
+                    window.declare_damage(bounds(0.0, 50.0, 200.0, 50.0));
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(0.0, 50.0, 200.0, 50.0)),
+                "a lone declaration"
+            );
+
+            window
+                .update(cx, |_, window, cx| {
+                    window.declare_damage(bounds(0.0, 50.0, 200.0, 50.0));
+                    window.bounds_changed(cx);
+                })
+                .unwrap();
+            assert_eq!(last_frame_damage(&window, cx), None, "resize beside a declaration");
+        }
+
+        #[gpui::test]
+        fn declared_rects_union_and_clip_to_the_viewport(cx: &mut TestAppContext) {
+            let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| Entries);
+            cx.run_until_parked();
+
+            window
+                .update(cx, |_, window, _| {
+                    window.declare_damage(bounds(0.0, 50.0, 200.0, 50.0));
+                    window.declare_damage(bounds(300.0, 0.0, 100.0, 20.0));
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(0.0, 0.0, 400.0, 100.0)),
+                "two rects resolve to their union"
+            );
+
+            window
+                .update(cx, |_, window, _| {
+                    window.declare_damage(bounds(700.0, 550.0, 500.0, 500.0));
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(700.0, 550.0, 100.0, 50.0)),
+                "a rect past the viewport edge is clipped"
+            );
+
+            window
+                .update(cx, |_, window, _| {
+                    window.declare_damage(bounds(900.0, 700.0, 10.0, 10.0));
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx).map(|damage| damage.size),
+                Some(size(px(0.0), px(0.0))),
+                "a rect outside the viewport resolves to an empty region"
+            );
+
+            let dirty = window
+                .update(cx, |_, window, _| window.invalidator.is_dirty())
+                .unwrap();
+            assert!(!dirty, "a drawn frame leaves nothing pending");
+        }
+
+        #[gpui::test]
+        fn notify_within_scopes_the_frame_and_still_reaches_observers(cx: &mut TestAppContext) {
+            let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| Entries);
+            cx.run_until_parked();
+            let view = window.root(cx).unwrap();
+            let observed = Rc::new(Cell::new(0));
+            let _subscription = cx.update({
+                let observed = observed.clone();
+                move |cx| cx.observe(&view, move |_, _| observed.set(observed.get() + 1))
+            });
+
+            window
+                .update(cx, |_, _, cx| cx.notify_within(bounds(0.0, 50.0, 200.0, 50.0)))
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(0.0, 50.0, 200.0, 50.0))
+            );
+            assert_eq!(observed.get(), 1, "observers see a scoped notify");
+
+            window
+                .update(cx, |_, _, cx| cx.notify_within(bounds(0.0, 0.0, 0.0, 0.0)))
+                .unwrap();
+            assert_eq!(observed.get(), 2);
+        }
+
+        struct NotifiesWhileDrawing {
+            renders: usize,
+        }
+
+        impl Render for NotifiesWhileDrawing {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.renders += 1;
+                if self.renders == 2 {
+                    cx.notify();
+                }
+                div().size_full()
+            }
+        }
+
+        #[gpui::test]
+        fn an_unscoped_notify_raised_while_drawing_makes_the_next_frame_whole(
+            cx: &mut TestAppContext,
+        ) {
+            let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| {
+                NotifiesWhileDrawing { renders: 0 }
+            });
+            cx.run_until_parked();
+            assert_eq!(last_frame_damage(&window, cx), None, "mount");
+
+            window
+                .update(cx, |_, _, cx| cx.notify_within(bounds(0.0, 0.0, 10.0, 10.0)))
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(0.0, 0.0, 10.0, 10.0)),
+                "the frame whose render notified keeps its own declared bounds"
+            );
+
+            window
+                .update(cx, |_, window, _| {
+                    window.declare_damage(bounds(0.0, 0.0, 10.0, 10.0));
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                None,
+                "the frame after it, where the view re-renders, is whole"
+            );
+
+            window
+                .update(cx, |_, window, _| {
+                    window.declare_damage(bounds(0.0, 0.0, 10.0, 10.0));
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(0.0, 0.0, 10.0, 10.0)),
+                "the in-draw notify does not outlive the frame it applied to"
+            );
+        }
+
+        struct Spinner {
+            offset: Rc<Cell<f32>>,
+        }
+
+        impl Render for Spinner {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size(px(400.0)).child(
+                    div()
+                        .ml(px(self.offset.get()))
+                        .w(px(58.0))
+                        .h(px(20.0))
+                        .with_animation(
+                            "spin",
+                            crate::Animation::new(Duration::from_millis(500)).repeat(),
+                            |element, delta| element.opacity(delta),
+                        ),
+                )
+            }
+        }
+
+        #[gpui::test]
+        fn a_mounted_animation_repaints_only_where_it_was_and_where_it_is(
+            cx: &mut TestAppContext,
+        ) {
+            let offset = Rc::new(Cell::new(0.0));
+            let window = cx.open_window(size(px(400.0), px(400.0)), {
+                let offset = offset.clone();
+                move |_, _| Spinner { offset }
+            });
+            cx.run_until_parked();
+            assert_eq!(last_frame_damage(&window, cx), None, "mount");
+
+            for frame in 0..3 {
+                cx.executor().advance_clock(Duration::from_millis(50));
+                window
+                    .update(cx, |_, window, cx| {
+                        assert_eq!(window.simulate_next_frame(cx), 1);
+                    })
+                    .unwrap();
+                assert_eq!(
+                    last_frame_damage(&window, cx),
+                    Some(bounds(0.0, 0.0, 58.0, 20.0)),
+                    "animation frame {frame} touches the spinner only"
+                );
+            }
+
+            offset.set(100.0);
+            cx.executor().advance_clock(Duration::from_millis(50));
+            window
+                .update(cx, |_, window, cx| {
+                    assert_eq!(window.simulate_next_frame(cx), 1);
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(0.0, 0.0, 158.0, 20.0)),
+                "a moved spinner repaints its old and new bounds"
+            );
+
+            cx.executor().advance_clock(Duration::from_millis(50));
+            window
+                .update(cx, |_, window, cx| {
+                    assert_eq!(window.simulate_next_frame(cx), 1);
+                })
+                .unwrap();
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                Some(bounds(100.0, 0.0, 58.0, 20.0)),
+                "the old position is not carried past the frame that cleared it"
+            );
+        }
     }
 }

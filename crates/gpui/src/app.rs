@@ -2679,6 +2679,26 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
+        self.notify_with(entity_id, |invalidator, cx| {
+            invalidator.invalidate_view(entity_id, cx);
+        });
+    }
+
+    /// Like [`App::notify`], but declares that the entity's next render changes
+    /// pixels only inside `bounds` (window coordinates). Every window that
+    /// displays the entity repaints that region and keeps the previous frame's
+    /// pixels elsewhere.
+    pub fn notify_within(&mut self, entity_id: EntityId, bounds: Bounds<Pixels>) {
+        self.notify_with(entity_id, |invalidator, cx| {
+            invalidator.invalidate_view_within(entity_id, bounds, cx);
+        });
+    }
+
+    fn notify_with(
+        &mut self,
+        entity_id: EntityId,
+        invalidate: impl Fn(&WindowInvalidator, &mut App),
+    ) {
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)
@@ -2706,7 +2726,7 @@ impl App {
             }
         } else {
             for invalidator in &live_invalidators {
-                invalidator.invalidate_view(entity_id, self);
+                invalidate(invalidator, self);
             }
         }
 

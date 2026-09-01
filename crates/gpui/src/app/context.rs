@@ -1,7 +1,8 @@
 use crate::{
-    AnyView, AnyWindowHandle, AppContext, AsyncApp, DispatchPhase, Effect, EntityId, EventEmitter,
-    FocusHandle, FocusOutEvent, Focusable, Global, KeystrokeObserver, Priority, Reservation,
-    SubscriberSet, Subscription, Task, WeakEntity, WeakFocusHandle, Window, WindowHandle,
+    AnyView, AnyWindowHandle, AppContext, AsyncApp, Bounds, DispatchPhase, Effect, EntityId,
+    EventEmitter, FocusHandle, FocusOutEvent, Focusable, Global, KeystrokeObserver, Pixels,
+    Priority, Reservation, SubscriberSet, Subscription, Task, WeakEntity, WeakFocusHandle, Window,
+    WindowHandle,
 };
 use anyhow::Result;
 use futures::FutureExt;
@@ -228,6 +229,16 @@ impl<'a, T: 'static> Context<'a, T> {
     /// Tell GPUI that this entity has changed and observers of it should be notified.
     pub fn notify(&mut self) {
         self.app.notify(self.entity_state.entity_id);
+    }
+
+    /// Tell GPUI that this entity has changed inside `bounds` only: observers
+    /// are notified as with [`Context::notify`], and windows displaying the
+    /// entity repaint only that region, in window coordinates. Use it when the
+    /// change is confined to one element whose bounds are known, such as an
+    /// entry appended to a list.
+    pub fn notify_within(&mut self, bounds: Bounds<Pixels>) {
+        self.app
+            .notify_within(self.entity_state.entity_id, bounds);
     }
 
     /// Spawn the future returned by the given function.

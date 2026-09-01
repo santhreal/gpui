@@ -1988,34 +1988,47 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
-        window.with_image_cache(image_cache, |window| {
-            self.interactivity.paint(
-                global_id,
-                inspector_id,
-                bounds,
-                hitbox.as_ref(),
-                window,
-                cx,
-                |style, window, cx| {
-                    // skip children
-                    if style.display == Display::None {
-                        return;
-                    }
-
-                    if let Some(z_index) = style.z_index {
-                        window.with_z_index(z_index, |window| {
-                            for child in &mut self.children {
-                                child.paint(window, cx);
-                            }
-                        });
-                    } else {
-                        for child in &mut self.children {
-                            child.paint(window, cx);
-                        }
-                    }
-                },
-            );
+        // The z-index covers the element's own background and border as well
+        // as its children, so the base style is consulted: a hover or active
+        // refinement must not move an element between stacking positions.
+        let z_index = self.interactivity.base_style.z_index;
+        window.with_image_cache(image_cache, |window| match z_index {
+            Some(z_index) => window.with_z_index(z_index, |window| {
+                self.paint_interactivity(global_id, inspector_id, bounds, hitbox, window, cx)
+            }),
+            None => self.paint_interactivity(global_id, inspector_id, bounds, hitbox, window, cx),
         });
+    }
+}
+
+impl Div {
+    fn paint_interactivity(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.interactivity.paint(
+            global_id,
+            inspector_id,
+            bounds,
+            hitbox.as_ref(),
+            window,
+            cx,
+            |style, window, cx| {
+                // skip children
+                if style.display == Display::None {
+                    return;
+                }
+
+                for child in &mut self.children {
+                    child.paint(window, cx);
+                }
+            },
+        );
     }
 }
 
@@ -2303,9 +2316,14 @@ impl Interactivity {
                 }
 
                 window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
-                        |window| {
+                    let mut mask = style.overflow_mask(bounds, window.rem_size());
+                    if let Some(mask) = mask.as_mut() {
+                        mask.corner_radii = style
+                            .corner_radii
+                            .to_pixels(window.rem_size())
+                            .clamp_radii_for_quad_size(bounds.size);
+                    }
+                    window.with_content_mask(mask, |window| {
                             let hitbox = if self.should_insert_hitbox(&style, window, cx) {
                                 Some(window.insert_hitbox(bounds, self.hitbox_behavior))
                             } else {
@@ -2458,9 +2476,14 @@ impl Interactivity {
                     window.with_transformation(transformation, |window| {
                         style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                             window.with_text_style(style.text_style().cloned(), |window| {
-                                window.with_content_mask(
-                                    style.overflow_mask(bounds, window.rem_size()),
-                                    |window| {
+                                let mut mask = style.overflow_mask(bounds, window.rem_size());
+                                if let Some(mask) = mask.as_mut() {
+                                    mask.corner_radii = style
+                                        .corner_radii
+                                        .to_pixels(window.rem_size())
+                                        .clamp_radii_for_quad_size(bounds.size);
+                                }
+                                window.with_content_mask(mask, |window| {
                                         window.with_tab_group(tab_group, |window| {
                                             // Register the container's own focus handle *inside* its
                                             // tab group, so that focusing the container and then

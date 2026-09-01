@@ -4,7 +4,7 @@ struct SubpixelSprite {
     order: u32,
     pad: u32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     tile: AtlasTile,
     transformation: TransformationMatrix,
@@ -15,7 +15,9 @@ struct SubpixelSpriteOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) window_position: vec2<f32>,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) sprite_id: u32,
 }
 
 struct SubpixelSpriteFragmentOutput {
@@ -27,12 +29,16 @@ struct SubpixelSpriteFragmentOutput {
 fn vs_subpixel_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> SubpixelSpriteOutput {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let sprite = b_subpixel_sprites[instance_id];
+    let position = unit_vertex * sprite.bounds.size + sprite.bounds.origin;
+    let transformed = transpose(sprite.transformation.rotation_scale) * position + sprite.transformation.translation;
 
     var out = SubpixelSpriteOutput();
-    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+    out.position = to_device_position_impl(transformed);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.clip_distances = distance_from_clip_rect_impl(transformed, sprite.content_mask.bounds);
+    out.window_position = transformed;
+    out.sprite_id = instance_id;
     return out;
 }
 
@@ -49,8 +55,15 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
         return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
     }
 
+    let sprite = b_subpixel_sprites[input.sprite_id];
+    let mask_sdf = quad_sdf(input.window_position, sprite.content_mask.bounds, sprite.content_mask.corner_radii);
+    if (mask_sdf >= 0.5) {
+        return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
+    }
+    let clip_alpha = saturate(0.5 - mask_sdf);
+
     var out = SubpixelSpriteFragmentOutput();
     out.foreground = vec4<f32>(input.color.rgb, 1.0);
-    out.alpha = vec4<f32>(input.color.a * alpha_corrected, 1.0);
+    out.alpha = vec4<f32>(input.color.a * alpha_corrected * clip_alpha, 1.0);
     return out;
 }
