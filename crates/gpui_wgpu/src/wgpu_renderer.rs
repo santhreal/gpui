@@ -3420,4 +3420,201 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn test_inset_shadow_and_inset_hairline_on_rounded_rect_at_scale_factors() {
+        use gpui::{Bounds, ContentMask, Corners, Hsla, Point, ScaledPixels, Scene, Shadow, Size};
+
+        for scale in [1.0, 2.0] {
+            let width = (100.0 * scale) as i32;
+            let height = (100.0 * scale) as i32;
+
+            let instance = WgpuContext::surfaceless_instance();
+            let context =
+                WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+            let size_device = gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height));
+            let mut renderer =
+                WgpuRenderer::new_offscreen(&context, size_device).expect("renderer");
+
+            // 1. Inset Hairline (spread = 2px, blur = 0px)
+            // Element: 100x100 at (0, 0), corner radius 20px
+            // Hole: 96x96 at (2, 2), corner radius 18px
+            let mut scene = Scene::default();
+            scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(0.0),
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(2.0 * scale),
+                        y: ScaledPixels(2.0 * scale),
+                    },
+                    size: Size {
+                        width: ScaledPixels(96.0 * scale),
+                        height: ScaledPixels(96.0 * scale),
+                    },
+                },
+                content_mask: ContentMask {
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(0.0),
+                            y: ScaledPixels(0.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(100.0 * scale),
+                            height: ScaledPixels(100.0 * scale),
+                        },
+                    },
+                },
+                corner_radii: Corners::all(ScaledPixels(18.0 * scale)),
+                color: Hsla {
+                    h: 0.0,
+                    s: 1.0,
+                    l: 0.5,
+                    a: 1.0,
+                },
+                element_bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(100.0 * scale),
+                        height: ScaledPixels(100.0 * scale),
+                    },
+                },
+                element_corner_radii: Corners::all(ScaledPixels(20.0 * scale)),
+                inset: 1,
+                pad: 0,
+                transformation: TransformationMatrix::unit(),
+            });
+
+            assert!(renderer.draw(&scene));
+            let bytes = renderer.read_pixels().expect("read pixels");
+            let pitch = (100.0 * scale) as usize * 4;
+            let pixel_at = |lx: f32, ly: f32| -> [u8; 4] {
+                let px = (lx * scale) as usize;
+                let py = (ly * scale) as usize;
+                let offset = py * pitch + px * 4;
+                [
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]
+            };
+
+            // Geometric corner outside radius: (2, 2) has distance ~25.46 to (20, 20) > 20 -> alpha 0
+            let outside = pixel_at(2.0, 2.0);
+            assert!(
+                outside[3] < 30,
+                "geometric corner outside radius must be untouched (alpha 0) at scale {scale}, got {outside:?}"
+            );
+
+            // Pixel just inside the outer rounded corner edge on the 45-degree diagonal:
+            // Arc center (20, 20), radius 19.0 -> (20 - 13.44, 20 - 13.44) ~ (6.56, 6.56)
+            let corner_hairline = pixel_at(6.5, 6.5);
+            assert!(
+                corner_hairline[3] > 220 && corner_hairline[0] > 220,
+                "pixel just inside rounded corner arc must be hairline color at scale {scale}, got {corner_hairline:?}"
+            );
+
+            // Pixel just inside the straight border edge: (1.0, 50.0) -> alpha 255
+            let straight_hairline = pixel_at(1.0, 50.0);
+            assert!(
+                straight_hairline[3] > 220 && straight_hairline[0] > 220,
+                "pixel just inside straight edge must be hairline color at scale {scale}, got {straight_hairline:?}"
+            );
+
+            // Pixel deep inside the interior hole: (50.0, 50.0) -> alpha 0
+            let interior = pixel_at(50.0, 50.0);
+            assert!(
+                interior[3] < 30,
+                "interior hole inside hairline must be untouched (alpha 0) at scale {scale}, got {interior:?}"
+            );
+
+            // 2. Blurred Inset Shadow (spread = 0px, blur = 8px)
+            let mut blur_scene = Scene::default();
+            blur_scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(8.0 * scale),
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(100.0 * scale),
+                        height: ScaledPixels(100.0 * scale),
+                    },
+                },
+                content_mask: ContentMask {
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(0.0),
+                            y: ScaledPixels(0.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(100.0 * scale),
+                            height: ScaledPixels(100.0 * scale),
+                        },
+                    },
+                },
+                corner_radii: Corners::all(ScaledPixels(20.0 * scale)),
+                color: Hsla {
+                    h: 0.0,
+                    s: 1.0,
+                    l: 0.5,
+                    a: 1.0,
+                },
+                element_bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(100.0 * scale),
+                        height: ScaledPixels(100.0 * scale),
+                    },
+                },
+                element_corner_radii: Corners::all(ScaledPixels(20.0 * scale)),
+                inset: 1,
+                pad: 0,
+                transformation: TransformationMatrix::unit(),
+            });
+
+            assert!(renderer.draw(&blur_scene));
+            let blur_bytes = renderer.read_pixels().expect("read blur pixels");
+            let blur_pixel_at = |lx: f32, ly: f32| -> [u8; 4] {
+                let px = (lx * scale) as usize;
+                let py = (ly * scale) as usize;
+                let offset = py * pitch + px * 4;
+                [
+                    blur_bytes[offset],
+                    blur_bytes[offset + 1],
+                    blur_bytes[offset + 2],
+                    blur_bytes[offset + 3],
+                ]
+            };
+
+            // Blurred inset shadow: geometric corner outside radius remains clipped/untouched
+            let blur_outside = blur_pixel_at(2.0, 2.0);
+            assert!(
+                blur_outside[3] < 30,
+                "blurred inset shadow must stay clipped to element bounds at geometric corner, got {blur_outside:?}"
+            );
+
+            // Near the boundary inside the element: shadow is active
+            let blur_edge = blur_pixel_at(3.0, 50.0);
+            assert!(
+                blur_edge[3] > 50,
+                "blurred inset shadow must be non-zero near edge, got {blur_edge:?}"
+            );
+
+            // Deep interior: blurred shadow attenuates to zero
+            let blur_interior = blur_pixel_at(50.0, 50.0);
+            assert!(
+                blur_interior[3] < 30,
+                "blurred inset shadow must attenuate in deep interior, got {blur_interior:?}"
+            );
+        }
+    }
 }
