@@ -2,8 +2,9 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    Pixels, Point, Radians, SharedString, Size, StrikethroughStyle, StyleRefinement, TextAlign,
+    TextOverflow, TextStyleRefinement, Transformation, UnderlineStyle, WhiteSpace, px, relative,
+    rems, size,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -899,6 +900,65 @@ pub trait Styled: Sized {
     #[cfg(debug_assertions)]
     fn debug_below(mut self) -> Self {
         self.style().debug_below = Some(true);
+        self
+    }
+    /// Apply a transformation to this element.
+    fn transform(mut self, transform: Transformation) -> Self {
+        self.style().transformation = Some(transform);
+        self
+    }
+
+    /// Apply a transformation to this element.
+    fn with_transformation(mut self, transform: Transformation) -> Self {
+        self.style().transformation = Some(transform);
+        self
+    }
+
+    /// Apply a rotation to this element around its center.
+    fn rotate(mut self, angle: impl Into<Radians>) -> Self {
+        let mut transformation = self.style().transformation.unwrap_or_default();
+        transformation.rotate = angle.into();
+        self.style().transformation = Some(transformation);
+        self
+    }
+
+    /// Apply scaling to this element around its center.
+    fn scale(mut self, factor: f32) -> Self {
+        let mut transformation = self.style().transformation.unwrap_or_default();
+        transformation.scale = size(factor, factor);
+        self.style().transformation = Some(transformation);
+        self
+    }
+
+    /// Apply scaling on x and y to this element around its center.
+    fn scale_xy(mut self, scale: Size<f32>) -> Self {
+        let mut transformation = self.style().transformation.unwrap_or_default();
+        transformation.scale = scale;
+        self.style().transformation = Some(transformation);
+        self
+    }
+
+    /// Apply translation to this element.
+    fn translate(mut self, offset: Point<Pixels>) -> Self {
+        let mut transformation = self.style().transformation.unwrap_or_default();
+        transformation.translate = offset;
+        self.style().transformation = Some(transformation);
+        self
+    }
+
+    /// Apply translation along the X axis.
+    fn translate_x(mut self, x: impl Into<Pixels>) -> Self {
+        let mut transformation = self.style().transformation.unwrap_or_default();
+        transformation.translate.x = x.into();
+        self.style().transformation = Some(transformation);
+        self
+    }
+
+    /// Apply translation along the Y axis.
+    fn translate_y(mut self, y: impl Into<Pixels>) -> Self {
+        let mut transformation = self.style().transformation.unwrap_or_default();
+        transformation.translate.y = y.into();
+        self.style().transformation = Some(transformation);
         self
     }
 }

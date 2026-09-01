@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, Size, TransformationMatrix, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -19,7 +19,7 @@ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
 /// Shader variant for backends with storage buffer support: the shared shader
-/// logic plus the storage-buffer instance transport.
+/// logic plus the storage-buffer instance transport (recompiled).
 const STORAGE_BUFFER_SHADERS: &str = concat!(
     include_str!("shaders.wgsl"),
     include_str!("shaders_storage.wgsl"),
@@ -107,6 +107,7 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    transformation: TransformationMatrix,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1784,13 +1785,13 @@ impl WgpuRenderer {
             paths
                 .iter()
                 .map(|p| PathSprite {
-                    bounds: p.clipped_bounds(),
+                    bounds: p.transformation.apply_to_bounds(p.clipped_bounds()),
                 })
                 .collect()
         } else {
-            let mut bounds = first_path.clipped_bounds();
+            let mut bounds = first_path.transformation.apply_to_bounds(first_path.clipped_bounds());
             for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
+                bounds = bounds.union(&path.transformation.apply_to_bounds(path.clipped_bounds()));
             }
             vec![PathSprite { bounds }]
         };
@@ -1824,12 +1825,13 @@ impl WgpuRenderer {
     ) -> Result<bool> {
         let mut vertices = Vec::new();
         for path in paths {
-            let bounds = path.clipped_bounds();
+            let bounds = path.transformation.apply_to_bounds(path.bounds).intersect(&path.content_mask.bounds);
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                transformation: path.transformation,
             }));
         }
 
@@ -2505,14 +2507,14 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 46 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 34 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 32 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 22 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 30 * 4);
     }
 
     fn build_test_quad_scene(x: f32, width: f32, height: f32) -> Scene {
@@ -2555,6 +2557,7 @@ mod tests {
             border_color: Hsla::default(),
             corner_radii: Corners::default(),
             border_widths: Edges::default(),
+            transformation: TransformationMatrix::unit(),
         });
         scene
     }
@@ -2799,6 +2802,243 @@ mod tests {
         assert!(
             bytes.iter().all(|&b| b == 0),
             "cleared frame must have all zero bytes (transparent black), proving no garbage initialization"
+        );
+    }
+
+    #[test]
+    // P1 golden test for affine transforms
+    fn test_headless_affine_transforms_all_primitives_at_scale_factors() {
+        use crate::cosmic_text_system::CosmicTextSystem;
+        use gpui::{
+            AppContext, Context, HeadlessAppContext, IntoElement, ParentElement,
+            PlatformHeadlessRenderer, Render, Styled, Window, div, px, rgb, size,
+        };
+        struct QuadView(bool);
+        impl Render for QuadView {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let quad = if self.0 {
+                    div().absolute().top(px(10.0)).left(px(10.0)).w(px(40.0)).h(px(40.0)).bg(rgb(0xff0000)).translate_x(px(50.0))
+                } else {
+                    div().absolute().top(px(10.0)).left(px(10.0)).w(px(40.0)).h(px(40.0)).bg(rgb(0xff0000))
+                };
+                div().size_full().child(quad)
+            }
+        }
+
+        struct ShadowView(bool);
+        impl Render for ShadowView {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let shadow = if self.0 {
+                    div().absolute().top(px(20.0)).left(px(20.0)).w(px(40.0)).h(px(40.0)).shadow_lg().translate_x(px(50.0))
+                } else {
+                    div().absolute().top(px(20.0)).left(px(20.0)).w(px(40.0)).h(px(40.0)).shadow_lg()
+                };
+                div().size_full().child(shadow)
+            }
+        }
+
+        struct TextView(bool);
+        impl Render for TextView {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let text = if self.0 {
+                    div().absolute().top(px(10.0)).left(px(10.0)).translate_y(px(30.0)).text_color(rgb(0xffffff)).child("Affine Transform")
+                } else {
+                    div().absolute().top(px(10.0)).left(px(10.0)).text_color(rgb(0xffffff)).child("Affine Transform")
+                };
+                div().size_full().child(text)
+            }
+        }
+
+        struct UnderlineView(bool);
+        impl Render for UnderlineView {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let underline = if self.0 {
+                    div().absolute().top(px(20.0)).left(px(10.0)).w(px(80.0)).h(px(20.0)).translate_y(px(30.0)).text_color(rgb(0xffffff)).underline().child("Underline")
+                } else {
+                    div().absolute().top(px(20.0)).left(px(10.0)).w(px(80.0)).h(px(20.0)).text_color(rgb(0xffffff)).underline().child("Underline")
+                };
+                div().size_full().child(underline)
+            }
+        }
+
+        for scale in [1.0, 2.0] {
+            let text_system = Arc::new(CosmicTextSystem::new("sans-serif"));
+            let width = (160.0 * scale) as i32;
+            let height = (100.0 * scale) as i32;
+            let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), move || {
+                WgpuHeadlessRenderer::new(size(gpui::DevicePixels(width), gpui::DevicePixels(height)))
+                    .ok()
+                    .map(|r| Box::new(r) as Box<dyn PlatformHeadlessRenderer>)
+            });
+
+            // 1. Quad affine transform validation
+            let frame_quad_untrans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| QuadView(false))
+                })
+                .expect("render quad untransformed");
+            let frame_quad_trans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| QuadView(true))
+                })
+                .expect("render quad transformed");
+
+            assert_ne!(
+                frame_quad_untrans.as_bytes(),
+                frame_quad_trans.as_bytes(),
+                "transformed quad must differ from untransformed quad at scale {scale}"
+            );
+            let q_untrans_bytes = frame_quad_untrans.as_bytes();
+            let q_trans_bytes = frame_quad_trans.as_bytes();
+            let stride = (160.0 * scale) as usize * 4;
+            let px_x = 60;
+            let px_y = 60;
+            let idx_untrans = px_y * stride + px_x * 4;
+            assert!(
+                q_untrans_bytes[idx_untrans] > 200 && q_untrans_bytes[idx_untrans + 3] == 255,
+                "untransformed quad should be solid red at device ({px_x}, {px_y}) for scale {scale}"
+            );
+            assert_eq!(
+                &q_trans_bytes[idx_untrans..idx_untrans + 4],
+                &[0, 0, 0, 0],
+                "transformed quad must be clear at original device position ({px_x}, {px_y}) for scale {scale}"
+            );
+
+            let trans_x = 140;
+            let idx_trans = px_y * stride + trans_x * 4;
+            assert!(
+                q_trans_bytes[idx_trans] > 200 && q_trans_bytes[idx_trans + 3] == 255,
+                "transformed quad must be solid red at new device position ({trans_x}, {px_y}) for scale {scale}"
+            );
+            assert_eq!(
+                &q_untrans_bytes[idx_trans..idx_trans + 4],
+                &[0, 0, 0, 0],
+                "untransformed quad must be clear at translated device position ({trans_x}, {px_y}) for scale {scale}"
+            );
+            // 2. Shadow affine transform validation
+            let frame_shadow_untrans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| ShadowView(false))
+                })
+                .expect("render shadow untransformed");
+            let frame_shadow_trans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| ShadowView(true))
+                })
+                .expect("render shadow transformed");
+
+            assert_ne!(
+                frame_shadow_untrans.as_bytes(),
+                frame_shadow_trans.as_bytes(),
+                "transformed shadow must differ from untransformed shadow at scale {scale}"
+            );
+
+            // 3. Text (glyph run) affine transform validation
+            let frame_text_untrans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| TextView(false))
+                })
+                .expect("render text untransformed");
+            let frame_text_trans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| TextView(true))
+                })
+                .expect("render text transformed");
+
+            assert_ne!(
+                frame_text_untrans.as_bytes(),
+                frame_text_trans.as_bytes(),
+                "transformed text must differ from untransformed text at scale {scale}"
+            );
+
+            // 4. Underline (path) affine transform validation
+            let frame_underline_untrans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| UnderlineView(false))
+                })
+                .expect("render underline untransformed");
+            let frame_underline_trans = cx
+                .render_frame(size(px(160.0), px(100.0)), scale, |_window, cx| {
+                    cx.new(|_| UnderlineView(true))
+                })
+                .expect("render underline transformed");
+
+            assert_ne!(
+                frame_underline_untrans.as_bytes(),
+                frame_underline_trans.as_bytes(),
+                "transformed underline must differ from untransformed underline at scale {scale}"
+            );
+        }
+
+        // 5. Scene primitive affine transform validation for Path and Sprite
+        let instance = WgpuContext::surfaceless_instance();
+        let context = WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+        let dev_size = size(gpui::DevicePixels(160), gpui::DevicePixels(100));
+        let mut renderer = WgpuRenderer::new_offscreen(&context, dev_size).expect("renderer");
+
+        let mut scene_untrans = Scene::default();
+        let mut path_untrans = gpui::Path::new(gpui::point(px(10.0), px(10.0)));
+        path_untrans.line_to(gpui::point(px(50.0), px(10.0)));
+        path_untrans.line_to(gpui::point(px(50.0), px(50.0)));
+        path_untrans.line_to(gpui::point(px(10.0), px(50.0)));
+        path_untrans.color = gpui::solid_background(rgb(0x00ff00));
+        path_untrans.bounds = gpui::Bounds::new(gpui::point(px(10.0), px(10.0)), gpui::size(px(40.0), px(40.0)));
+        path_untrans.content_mask = gpui::ContentMask { bounds: gpui::Bounds::new(gpui::point(px(0.0), px(0.0)), gpui::size(px(160.0), px(100.0))) };
+        scene_untrans.insert_primitive(path_untrans.scale(1.0));
+
+        let mut scene_trans = Scene::default();
+        let mut path_trans = path_untrans.scale(1.0);
+        path_trans.transformation = gpui::TransformationMatrix::unit().translate(gpui::point(gpui::ScaledPixels(50.0), gpui::ScaledPixels(0.0)));
+        scene_trans.insert_primitive(path_trans);
+        assert!(renderer.draw(&scene_untrans));
+        let path_untrans_bytes = renderer.read_pixels().expect("read path untrans");
+        assert!(renderer.draw(&scene_trans));
+        let path_trans_bytes = renderer.read_pixels().expect("read path trans");
+
+        assert_ne!(
+            path_untrans_bytes,
+            path_trans_bytes,
+            "transformed path must differ from untransformed path"
+        );
+        assert!(
+            path_trans_bytes.chunks_exact(4).any(|p| p[1] > 200),
+            "transformed path frame must contain rasterized green path pixels at new position"
+        );
+
+        // 6. Direct Underline primitive affine transform validation
+        let mut underline_scene_untrans = Scene::default();
+        underline_scene_untrans.insert_primitive(gpui::Underline {
+            order: 0,
+            pad: 0,
+            bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(10.0), gpui::ScaledPixels(20.0)), gpui::size(gpui::ScaledPixels(80.0), gpui::ScaledPixels(4.0))),
+            content_mask: gpui::ContentMask { bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(0.0)), gpui::size(gpui::ScaledPixels(160.0), gpui::ScaledPixels(100.0))) },
+            color: gpui::rgb(0xffffff).into(),
+            thickness: gpui::ScaledPixels(2.0),
+            wavy: false.into(),
+            transformation: gpui::TransformationMatrix::unit(),
+        });
+
+        let mut underline_scene_trans = Scene::default();
+        underline_scene_trans.insert_primitive(gpui::Underline {
+            order: 0,
+            pad: 0,
+            bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(10.0), gpui::ScaledPixels(20.0)), gpui::size(gpui::ScaledPixels(80.0), gpui::ScaledPixels(4.0))),
+            content_mask: gpui::ContentMask { bounds: gpui::Bounds::new(gpui::point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(0.0)), gpui::size(gpui::ScaledPixels(160.0), gpui::ScaledPixels(100.0))) },
+            color: gpui::rgb(0xffffff).into(),
+            thickness: gpui::ScaledPixels(2.0),
+            wavy: false.into(),
+            transformation: gpui::TransformationMatrix::unit().translate(gpui::point(gpui::ScaledPixels(50.0), gpui::ScaledPixels(0.0))),
+        });
+
+        assert!(renderer.draw(&underline_scene_untrans));
+        let direct_underline_untrans_bytes = renderer.read_pixels().expect("read underline untrans");
+        assert!(renderer.draw(&underline_scene_trans));
+        let direct_underline_trans_bytes = renderer.read_pixels().expect("read underline trans");
+
+        assert_ne!(
+            direct_underline_untrans_bytes,
+            direct_underline_trans_bytes,
+            "transformed underline primitive must differ from untransformed underline primitive"
         );
     }
 }

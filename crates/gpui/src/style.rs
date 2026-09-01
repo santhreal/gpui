@@ -8,8 +8,8 @@ use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Transformation,
+    TransformationMatrix, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -312,6 +312,8 @@ pub struct Style {
     /// The grid location of this element
     pub grid_location: Option<GridLocation>,
 
+    /// The transformation to apply to this element
+    pub transformation: Option<Transformation>,
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -331,6 +333,18 @@ impl StyleRefinement {
     /// The grid location of this element
     pub fn grid_location_mut(&mut self) -> &mut GridLocation {
         self.grid_location.get_or_insert_default()
+    }
+}
+impl Style {
+    /// Resolve the transformation matrix for this style given the laid-out element bounds and DPR.
+    pub fn transformation(
+        &self,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+    ) -> TransformationMatrix {
+        self.transformation
+            .map(|t| t.into_matrix(bounds.center(), scale_factor))
+            .unwrap_or(TransformationMatrix::unit())
     }
 }
 
@@ -812,8 +826,7 @@ impl Default for Style {
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
-
-            #[cfg(debug_assertions)]
+            transformation: None,
             debug: false,
             #[cfg(debug_assertions)]
             debug_below: false,

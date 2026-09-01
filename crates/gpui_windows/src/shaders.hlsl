@@ -507,7 +507,8 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
-};
+    TransformationMatrix transformation;
+}
 
 struct QuadVertexOutput {
     nointerpolation uint quad_id: TEXCOORD0;
@@ -864,7 +865,8 @@ struct Shadow {
     Corners element_corner_radii;
     uint inset;
     uint pad; // align to 8 bytes
-};
+    TransformationMatrix transformation;
+}
 
 struct ShadowVertexOutput {
     nointerpolation uint shadow_id: TEXCOORD0;
@@ -1070,7 +1072,8 @@ struct Underline {
     Hsla color;
     float thickness;
     uint wavy;
-};
+    TransformationMatrix transformation;
+}
 
 struct UnderlineVertexOutput {
   nointerpolation uint underline_id: TEXCOORD0;
@@ -1219,7 +1222,8 @@ struct PolychromeSprite {
     Bounds content_mask;
     Corners corner_radii;
     AtlasTile tile;
-};
+    TransformationMatrix transformation;
+}
 
 struct PolychromeSpriteVertexOutput {
     nointerpolation uint sprite_id: TEXCOORD0;

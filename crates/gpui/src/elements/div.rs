@@ -2427,8 +2427,10 @@ impl Interactivity {
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
-                    style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
-                        window.with_text_style(style.text_style().cloned(), |window| {
+                    let transformation = style.transformation(bounds, window.scale_factor());
+                    window.with_transformation(transformation, |window| {
+                        style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                            window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
                                 style.overflow_mask(bounds, window.rem_size()),
                                 |window| {
@@ -2514,6 +2516,7 @@ impl Interactivity {
                                     })
                                 },
                             );
+                            });
                         });
                     });
                 });

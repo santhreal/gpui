@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, px, radians, size,
 };
 use std::{
     fmt::Debug,
@@ -541,6 +541,7 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Quad> for Primitive {
@@ -560,6 +561,7 @@ pub struct Underline {
     pub color: Hsla,
     pub thickness: ScaledPixels,
     pub wavy: PaddedBool32,
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Underline> for Primitive {
@@ -583,6 +585,7 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Shadow> for Primitive {
@@ -602,8 +605,108 @@ pub enum BorderStyle {
     Dashed = 1,
 }
 
+/// A transformation to apply to an element.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Transformation {
+    /// Scaling factor along x and y axes.
+    pub scale: Size<f32>,
+    /// Translation offset.
+    pub translate: Point<Pixels>,
+    /// Rotation angle in radians.
+    pub rotate: Radians,
+    /// Transform origin. If None, the center of the element bounds is used.
+    pub origin: Option<Point<Pixels>>,
+}
+
+impl Default for Transformation {
+    fn default() -> Self {
+        Self {
+            scale: size(1.0, 1.0),
+            translate: point(px(0.0), px(0.0)),
+            rotate: radians(0.0),
+            origin: None,
+        }
+    }
+}
+
+impl Transformation {
+    /// Create an identity transformation.
+    pub fn unit() -> Self {
+        Self::default()
+    }
+
+    /// Create a transformation with the specified scale along each axis.
+    pub fn scale(scale: Size<f32>) -> Self {
+        Self {
+            scale,
+            translate: point(px(0.0), px(0.0)),
+            rotate: radians(0.0),
+            origin: None,
+        }
+    }
+
+    /// Create a transformation with uniform scaling.
+    pub fn uniform_scale(factor: f32) -> Self {
+        Self::scale(size(factor, factor))
+    }
+
+    /// Create a transformation with the specified translation.
+    pub fn translate(translate: Point<Pixels>) -> Self {
+        Self {
+            scale: size(1.0, 1.0),
+            translate,
+            rotate: radians(0.0),
+            origin: None,
+        }
+    }
+
+    /// Create a transformation with the specified rotation in radians.
+    pub fn rotate(rotate: impl Into<Radians>) -> Self {
+        Self {
+            scale: size(1.0, 1.0),
+            translate: point(px(0.0), px(0.0)),
+            rotate: rotate.into(),
+            origin: None,
+        }
+    }
+
+    /// Set the transform origin.
+    pub fn with_origin(mut self, origin: Point<Pixels>) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// Update the scaling factor of this transformation.
+    pub fn with_scaling(mut self, scale: Size<f32>) -> Self {
+        self.scale = scale;
+        self
+    }
+
+    /// Update the translation value of this transformation.
+    pub fn with_translation(mut self, translate: Point<Pixels>) -> Self {
+        self.translate = translate;
+        self
+    }
+
+    /// Update the rotation angle of this transformation.
+    pub fn with_rotation(mut self, rotate: impl Into<Radians>) -> Self {
+        self.rotate = rotate.into();
+        self
+    }
+
+    /// Convert this transformation into a 2x3 affine matrix for rendering.
+    pub fn into_matrix(self, center: Point<Pixels>, scale_factor: f32) -> TransformationMatrix {
+        let center = self.origin.unwrap_or(center);
+        TransformationMatrix::unit()
+            .translate(center.scale(scale_factor) + self.translate.scale(scale_factor))
+            .rotate(self.rotate)
+            .scale(self.scale)
+            .translate(center.scale(-scale_factor))
+    }
+}
+
 /// A data type representing a 2 dimensional transformation that can be applied to an element.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
 pub struct TransformationMatrix {
     /// 2x2 matrix containing rotation and scale,
@@ -697,6 +800,40 @@ impl TransformationMatrix {
         }
         Point::new(output[0].into(), output[1].into())
     }
+
+    /// Apply transformation to a point in scaled pixels.
+    pub fn apply_scaled(&self, point: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        let input = [point.x.0, point.y.0];
+        let mut output = self.translation;
+        for (i, output_cell) in output.iter_mut().enumerate() {
+            for (k, input_cell) in input.iter().enumerate() {
+                *output_cell += self.rotation_scale[i][k] * *input_cell;
+            }
+        }
+        Point::new(ScaledPixels(output[0]), ScaledPixels(output[1]))
+    }
+
+    /// Apply this transformation to the 4 corners of a bounding box and return the
+    /// axis-aligned bounding box that encloses the transformed corners.
+    pub fn apply_to_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        if *self == Self::unit() {
+            return bounds;
+        }
+        let tl = self.apply_scaled(bounds.origin);
+        let tr = self.apply_scaled(point(bounds.right(), bounds.top()));
+        let br = self.apply_scaled(point(bounds.right(), bounds.bottom()));
+        let bl = self.apply_scaled(point(bounds.left(), bounds.bottom()));
+
+        let min_x = tl.x.min(tr.x).min(br.x).min(bl.x);
+        let max_x = tl.x.max(tr.x).max(br.x).max(bl.x);
+        let min_y = tl.y.min(tr.y).min(br.y).min(bl.y);
+        let max_y = tl.y.max(tr.y).max(br.y).max(bl.y);
+
+        Bounds {
+            origin: point(min_x, min_y),
+            size: size(max_x - min_x, max_y - min_y),
+        }
+    }
 }
 
 impl Default for TransformationMatrix {
@@ -755,6 +892,7 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    pub transformation: TransformationMatrix,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -793,6 +931,7 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub content_mask: ContentMask<P>,
     pub vertices: Vec<PathVertex<P>>,
     pub color: Background,
+    pub transformation: TransformationMatrix,
     start: Point<P>,
     current: Point<P>,
     contour_count: usize,
@@ -813,6 +952,7 @@ impl Path<Pixels> {
             },
             content_mask: Default::default(),
             color: Default::default(),
+            transformation: TransformationMatrix::unit(),
             contour_count: 0,
         }
     }
@@ -833,9 +973,9 @@ impl Path<Pixels> {
             current: self.current.scale(factor),
             contour_count: self.contour_count,
             color: self.color,
+            transformation: self.transformation,
         }
     }
-
     /// Move the start, current point to the given point.
     pub fn move_to(&mut self, to: Point<Pixels>) {
         self.contour_count += 1;

@@ -1156,6 +1156,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) transformation: TransformationMatrix,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1854,6 +1855,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            transformation: TransformationMatrix::unit(),
             requested_autoscroll: None,
             last_text_input_configuration: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3627,6 +3629,30 @@ impl Window {
         self.element_opacity = previous_opacity;
         result
     }
+    /// Returns the current transformation matrix being applied to elements.
+    pub fn transformation(&self) -> TransformationMatrix {
+        self.transformation
+    }
+
+    /// Sets the transformation matrix for the enclosed painting operations, composing
+    /// with any existing parent transformation.
+    pub fn with_transformation<R>(
+        &mut self,
+        transformation: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        if transformation == TransformationMatrix::unit() {
+            return f(self);
+        }
+
+        let previous_transformation = self.transformation;
+        self.transformation = previous_transformation.compose(transformation);
+        let result = f(self);
+        self.transformation = previous_transformation;
+        result
+    }
 
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
@@ -4012,10 +4038,10 @@ impl Window {
                 element_corner_radii,
                 inset: 0,
                 pad: 0,
+                transformation: self.transformation,
             });
         }
     }
-
     /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
     /// be called after the element's background so the shadow layers on top of the fill.
     /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.
@@ -4057,10 +4083,10 @@ impl Window {
                 element_corner_radii,
                 inset: 1,
                 pad: 0,
+                transformation: self.transformation,
             });
         }
     }
-
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
         let radii = &quad.corner_radii;
         let widths = &quad.border_widths;
@@ -4124,8 +4150,8 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            transformation: self.transformation,
         };
-
         if !quad.background.is_transparent() {
             self.next_frame.scene.insert_primitive(quad);
             return;
@@ -4189,12 +4215,11 @@ impl Window {
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
+        path.transformation = self.transformation;
         self.next_frame
             .scene
             .insert_primitive(path.scale(scale_factor));
     }
-
-    /// Paint an underline into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_underline(
@@ -4226,9 +4251,9 @@ impl Window {
             color: style.color.unwrap_or_default().opacity(element_opacity),
             thickness,
             wavy: style.wavy.into(),
+            transformation: self.transformation,
         });
     }
-
     /// Paint a strikethrough into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -4256,6 +4281,7 @@ impl Window {
             thickness: self.snap_stroke(style.thickness),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: false.into(),
+            transformation: self.transformation,
         });
     }
 
@@ -4328,7 +4354,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation: self.transformation,
                 });
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -4338,7 +4364,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation: self.transformation,
                 });
             }
         }
@@ -4421,6 +4447,7 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                transformation: self.transformation,
             });
         }
         Ok(())
@@ -4593,10 +4620,10 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            transformation: self.transformation,
         });
         Ok(())
     }
-
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
