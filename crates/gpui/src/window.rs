@@ -125,6 +125,9 @@ struct WindowInvalidatorInner {
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
+    pub damage_rects: Vec<Bounds<Pixels>>,
+    pub last_frame_damage: Option<Bounds<Pixels>>,
+    pub full_invalidation: bool,
     #[cfg(feature = "profiler")]
     pub frame_dirty: FrameDirtyAccumulator,
     pub platform_waker: Option<Rc<dyn Fn()>>,
@@ -157,6 +160,9 @@ impl WindowInvalidator {
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
+                damage_rects: Vec::new(),
+                last_frame_damage: None,
+                full_invalidation: true,
                 #[cfg(feature = "profiler")]
                 frame_dirty: FrameDirtyAccumulator::default(),
                 platform_waker: None,
@@ -168,6 +174,7 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
+        inner.full_invalidation = true;
         if inner.draw_phase == DrawPhase::None {
             #[cfg(feature = "profiler")]
             let dirty_at = Self::record_frame_dirty(&mut inner);
@@ -191,6 +198,65 @@ impl WindowInvalidator {
         }
     }
 
+    pub fn invalidate_damage(&self, bounds: Bounds<Pixels>) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        inner.update_count += 1;
+        inner.damage_rects.push(bounds);
+        if inner.draw_phase == DrawPhase::None {
+            #[cfg(feature = "profiler")]
+            let dirty_at = Self::record_frame_dirty(&mut inner);
+            let became_dirty = !inner.dirty;
+            inner.dirty = true;
+            let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+            #[cfg(feature = "profiler")]
+            let window_id = inner.window_id;
+            drop(inner);
+            #[cfg(feature = "profiler")]
+            if became_dirty {
+                profiler::journal::record_frame_pending(window_id, dirty_at);
+            }
+            if let Some(waker) = waker {
+                waker();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn take_damage(&self, viewport: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+        let mut inner = self.inner.borrow_mut();
+        let damage = if inner.full_invalidation || inner.damage_rects.is_empty() {
+            Some(viewport)
+        } else {
+            let mut union_bounds = inner.damage_rects[0];
+            for r in &inner.damage_rects[1..] {
+                union_bounds = union_bounds.union(r);
+            }
+            Some(union_bounds.intersect(&viewport))
+        };
+        inner.last_frame_damage = damage;
+        inner.damage_rects.clear();
+        inner.full_invalidation = false;
+        damage
+    }
+
+    pub fn accumulated_damage(&self) -> Option<Bounds<Pixels>> {
+        let inner = self.inner.borrow();
+        if inner.damage_rects.is_empty() {
+            inner.last_frame_damage
+        } else {
+            let mut union_bounds = inner.damage_rects[0];
+            for r in &inner.damage_rects[1..] {
+                union_bounds = union_bounds.union(r);
+            }
+            Some(union_bounds)
+        }
+    }
+
+    pub fn last_frame_damage(&self) -> Option<Bounds<Pixels>> {
+        self.inner.borrow().last_frame_damage
+    }
     pub fn is_dirty(&self) -> bool {
         self.inner.borrow().dirty
     }
@@ -201,6 +267,7 @@ impl WindowInvalidator {
         inner.dirty = dirty;
         if dirty {
             inner.update_count += 1;
+            inner.full_invalidation = true;
         }
         #[cfg(feature = "profiler")]
         let dirty_at = dirty.then(|| Self::record_frame_dirty(&mut inner));
@@ -2041,6 +2108,26 @@ impl Window {
         }
     }
 
+    /// Invalidate only the specified damage rectangle rather than the whole window.
+    pub fn invalidate_damage(&mut self, bounds: Bounds<Pixels>) {
+        self.invalidator.invalidate_damage(bounds);
+    }
+
+    /// Feed an explicit damage rectangle into the window invalidator.
+    pub fn damage(&mut self, bounds: Bounds<Pixels>) {
+        self.invalidate_damage(bounds);
+    }
+
+    /// Returns the accumulated damage rectangle for the upcoming or most recent frame.
+    pub fn accumulated_damage(&self) -> Option<Bounds<Pixels>> {
+        self.invalidator.accumulated_damage()
+    }
+
+    /// Returns the damage rectangle of the last rendered frame.
+    pub fn last_frame_damage(&self) -> Option<Bounds<Pixels>> {
+        self.invalidator.last_frame_damage()
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
@@ -2887,6 +2974,10 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
+        let damage = self
+            .invalidator
+            .take_damage(Bounds::new(Point::default(), self.viewport_size));
+        self.next_frame.scene.damage = damage.map(|d| d.scale(self.scale_factor()));
         self.requested_autoscroll = None;
 
         // Restore the previously-used input handler.
@@ -7771,5 +7862,128 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    struct TranscriptView;
+
+    impl Render for TranscriptView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("entry-1")
+                        .w(px(200.0))
+                        .h(px(50.0))
+                        .bg(crate::black()),
+                )
+                .child(
+                    div()
+                        .id("entry-2")
+                        .w(px(200.0))
+                        .h(px(50.0))
+                        .bg(crate::black()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn test_damage_scoped_invalidation_contained_in_entry_box(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| TranscriptView);
+        cx.run_until_parked();
+
+        // Simulate TranscriptUpdated for entry-2: damage is fed for entry-2 box at (0, 50, 200, 50)
+        let entry_2_box = Bounds {
+            origin: point(px(0.0), px(50.0)),
+            size: size(px(200.0), px(50.0)),
+        };
+
+        window
+            .update(cx, |_, window, _| {
+                window.invalidate_damage(entry_2_box);
+            })
+            .unwrap();
+
+        let accumulated = window
+            .update(cx, |_, window, _| window.accumulated_damage())
+            .unwrap()
+            .expect("should have accumulated damage");
+
+        assert!(
+            accumulated.origin.x >= entry_2_box.origin.x
+                && accumulated.origin.y >= entry_2_box.origin.y
+                && accumulated.right() <= entry_2_box.right()
+                && accumulated.bottom() <= entry_2_box.bottom(),
+            "damage rect must be contained in entry box: damage {:?}, box {:?}",
+            accumulated,
+            entry_2_box
+        );
+
+        // Draw frame and verify last frame damage was contained in entry_2_box
+        window
+            .update(cx, |_, window, cx| {
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+
+        let frame_damage = window
+            .update(cx, |_, window, _| window.last_frame_damage())
+            .unwrap()
+            .expect("should record last frame damage");
+
+        assert_eq!(frame_damage, entry_2_box);
+    }
+
+    #[gpui::test]
+    fn test_mounted_animation_damage_contained_in_bounds(cx: &mut TestAppContext) {
+        use crate::AnimationExt;
+        use std::time::Duration;
+
+        struct SpinnerView;
+
+        impl Render for SpinnerView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size(px(400.0))
+                    .child(div().w(px(58.0)).h(px(20.0)).with_animation(
+                        "spin",
+                        crate::Animation::new(Duration::from_millis(500)).repeat(),
+                        |el, delta| el.opacity(delta),
+                    ))
+            }
+        }
+
+        let window = cx.open_window(size(px(400.0), px(400.0)), |_, _| SpinnerView);
+        cx.run_until_parked();
+
+        // Advance animation clock to trigger a frame
+        cx.executor().advance_clock(Duration::from_millis(50));
+        window
+            .update(cx, |_, window, cx| {
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+
+        // The animation paint invalidated its own bounds (58 x 20)
+        let accumulated = window
+            .update(cx, |_, window, _| window.accumulated_damage())
+            .unwrap()
+            .expect("spinner animation should have accumulated damage");
+
+        let spinner_bounds = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(58.0), px(20.0)),
+        };
+
+        assert!(
+            accumulated.size.width <= spinner_bounds.size.width
+                && accumulated.size.height <= spinner_bounds.size.height,
+            "mounted spinner damage must be contained within its bounds, got {:?}",
+            accumulated
+        );
     }
 }

@@ -51,6 +51,7 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub backdrop_blurs: Vec<BackdropBlur>,
+    pub damage: Option<Bounds<ScaledPixels>>,
 }
 
 #[expect(missing_docs)]
@@ -68,6 +69,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
+        self.damage = None;
     }
 
     pub fn len(&self) -> usize {

@@ -518,6 +518,7 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
         window: &mut Window,
         cx: &mut App,
     ) {
+        window.invalidate_damage(_bounds);
         element.paint(window, cx);
     }
 }
@@ -674,6 +675,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         window: &mut Window,
         cx: &mut App,
     ) {
+        window.invalidate_damage(_bounds);
         element.paint(window, cx);
     }
 }

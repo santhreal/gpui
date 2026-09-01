@@ -1625,6 +1625,20 @@ impl WgpuRenderer {
                 ..Default::default()
             });
 
+            if let Some(damage) = scene.damage {
+                let x = (damage.origin.x.0.max(0.0) as u32)
+                    .min(self.surface_config.width.saturating_sub(1));
+                let y = (damage.origin.y.0.max(0.0) as u32)
+                    .min(self.surface_config.height.saturating_sub(1));
+                let width = (damage.size.width.0.max(0.0) as u32)
+                    .min(self.surface_config.width.saturating_sub(x))
+                    .max(1);
+                let height = (damage.size.height.0.max(0.0) as u32)
+                    .min(self.surface_config.height.saturating_sub(y))
+                    .max(1);
+                pass.set_scissor_rect(x, y, width, height);
+            }
+
             for batch in scene.batches() {
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
@@ -1750,10 +1764,8 @@ impl WgpuRenderer {
                                 },
                             );
 
-                            let backdrop_bind_group = self.create_texture_bind_group(
-                                "backdrop_bind_group",
-                                backdrop_view,
-                            );
+                            let backdrop_bind_group = self
+                                .create_texture_bind_group("backdrop_bind_group", backdrop_view);
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_backdrop_blur"),
