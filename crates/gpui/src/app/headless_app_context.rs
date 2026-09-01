@@ -86,10 +86,13 @@ impl HeadlessAppContext {
             Some(renderer_factory),
         );
 
-        let text_system = Arc::new(TextSystem::new(platform_text_system));
         let http_client = Arc::new(crate::app::NullHttpClient);
         let app = App::new_app(platform, asset_source, http_client);
         app.borrow_mut().mode = GpuiMode::Production;
+        // The one text system every window in this app shapes through, so a
+        // caller observing shaping counts or the advance cache reads the real
+        // one rather than an idle twin.
+        let text_system = app.borrow().text_system().clone();
 
         Self {
             app,
