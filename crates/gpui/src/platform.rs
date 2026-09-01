@@ -996,8 +996,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
             height,
             scale_factor,
             image.into_raw(),
+            Vec::new(),
+            Vec::new(),
         ))
     }
+}
+
+/// A shaped text run's font size and bounding box within a rendered frame.
+///
+/// Both `font_size` and `bounds` are in logical pixels ([`Pixels`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextRunLayout {
+    /// The font size of the text run in logical pixels ([`Pixels`]).
+    pub font_size: Pixels,
+    /// The bounding box of the text run in logical pixels ([`Pixels`]).
+    pub bounds: Bounds<Pixels>,
 }
 
 /// A rasterized headless frame containing RGBA8 pixels and geometry metadata.
@@ -1007,16 +1020,27 @@ pub struct HeadlessFrame {
     height: u32,
     scale_factor: f32,
     bytes: Vec<u8>,
+    pub(crate) text_runs: Vec<TextRunLayout>,
+    pub(crate) hitboxes: Vec<Bounds<Pixels>>,
 }
 
 impl HeadlessFrame {
     /// Creates a new `HeadlessFrame`.
-    pub fn new(width: u32, height: u32, scale_factor: f32, bytes: Vec<u8>) -> Self {
+    pub fn new(
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        bytes: Vec<u8>,
+        text_runs: Vec<TextRunLayout>,
+        hitboxes: Vec<Bounds<Pixels>>,
+    ) -> Self {
         Self {
             width,
             height,
             scale_factor,
             bytes,
+            text_runs,
+            hitboxes,
         }
     }
 
@@ -1036,9 +1060,6 @@ impl HeadlessFrame {
     }
 
     /// Consumes the frame and returns the raw RGBA8 bytes.
-    ///
-    /// The buffer contains tightly packed 4-byte RGBA pixels with no row padding,
-    /// in row-major order.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -1046,6 +1067,16 @@ impl HeadlessFrame {
     /// Returns a slice of the raw RGBA8 bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Returns the shaped text runs and their font sizes in logical pixels ([`Pixels`]).
+    pub fn text_runs(&self) -> &[TextRunLayout] {
+        &self.text_runs
+    }
+
+    /// Returns the interactive hitbox bounds in logical pixels ([`Pixels`]).
+    pub fn hitboxes(&self) -> &[Bounds<Pixels>] {
+        &self.hitboxes
     }
 }
 
@@ -1079,6 +1110,8 @@ pub trait PlatformHeadlessRenderer {
             height,
             scale_factor,
             image.into_raw(),
+            Vec::new(),
+            Vec::new(),
         ))
     }
 

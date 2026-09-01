@@ -974,6 +974,7 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    pub(crate) text_runs: Vec<crate::TextRunLayout>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1020,6 +1021,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            text_runs: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1048,7 +1050,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
-        self.window_control_hitboxes.clear();
+        self.text_runs.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.focus = None;
@@ -2465,12 +2467,20 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
-    /// Renders the current frame's scene to a `HeadlessFrame` containing RGBA8 pixels.
+    /// Renders the current frame's scene to a `HeadlessFrame` containing RGBA8 pixels and geometry metadata.
     pub fn render_to_frame(&self, scale_factor: f32) -> anyhow::Result<crate::HeadlessFrame> {
-        self.platform_window
-            .render_to_frame(&self.rendered_frame.scene, scale_factor)
+        let mut frame = self
+            .platform_window
+            .render_to_frame(&self.rendered_frame.scene, scale_factor)?;
+        frame.text_runs = self.rendered_frame.text_runs.clone();
+        frame.hitboxes = self
+            .rendered_frame
+            .hitboxes
+            .iter()
+            .map(|h| h.bounds)
+            .collect();
+        Ok(frame)
     }
-
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
@@ -4369,6 +4379,11 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// Records a shaped text run's font size and bounds for the current frame.
+    pub fn record_text_run(&mut self, text_run: crate::TextRunLayout) {
+        self.next_frame.text_runs.push(text_run);
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {

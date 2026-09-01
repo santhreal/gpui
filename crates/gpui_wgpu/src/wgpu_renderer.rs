@@ -3149,4 +3149,134 @@ mod tests {
             "transformed underline primitive must differ from untransformed underline primitive"
         );
     }
+    #[test]
+    fn test_headless_frame_metadata_text_runs_and_hitboxes_at_scale_factors() {
+        use crate::cosmic_text_system::CosmicTextSystem;
+        use gpui::{
+            AppContext, Context, HeadlessAppContext, InteractiveElement, IntoElement,
+            ParentElement, PlatformHeadlessRenderer, Render, Styled, Window, div, px, rgb, size,
+        };
+        use std::collections::HashSet;
+        struct MultiSizeTextView;
+        impl Render for MultiSizeTextView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(rgb(0xffffff))
+                            .child("Heading 14px"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(24.0))
+                            .text_color(rgb(0xffffff))
+                            .child("Title 24px"),
+                    )
+            }
+        }
+
+        struct InteractiveAndInertView;
+        impl Render for InteractiveAndInertView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    // 1. Inert element: just background quad, no id or mouse listeners
+                    .child(div().w(px(50.0)).h(px(50.0)).bg(rgb(0xff0000)))
+                    // 2. Interactive element: carries an id and mouse handler
+                    .child(
+                        div()
+                            .id("clickable-button")
+                            .w(px(60.0))
+                            .h(px(30.0))
+                            .bg(rgb(0x00ff00))
+                            .on_mouse_down(gpui::MouseButton::Left, |_ev, _window, _cx| {}),
+                    )
+            }
+        }
+
+        struct EmptyView;
+        impl Render for EmptyView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().size_full()
+            }
+        }
+
+        for scale in [1.0, 2.0] {
+            let width = (200.0 * scale) as i32;
+            let height = (150.0 * scale) as i32;
+            let text_system = Arc::new(CosmicTextSystem::new("sans-serif"));
+            let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), move || {
+                WgpuHeadlessRenderer::new(size(
+                    gpui::DevicePixels(width),
+                    gpui::DevicePixels(height),
+                ))
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn PlatformHeadlessRenderer>)
+            });
+
+            // 1. Text metadata validation: exactly 2 distinct font sizes
+            let text_frame = cx
+                .render_frame(size(px(200.0), px(150.0)), scale, |_window, cx| {
+                    cx.new(|_| MultiSizeTextView)
+                })
+                .expect("render text frame");
+
+            let runs = text_frame.text_runs();
+            assert!(
+                !runs.is_empty(),
+                "text runs must be populated at scale {scale}"
+            );
+            let distinct_sizes: HashSet<_> = runs.iter().map(|r| r.font_size).collect();
+            assert_eq!(
+                distinct_sizes.len(),
+                2,
+                "must report exactly 2 distinct text sizes, found: {distinct_sizes:?}"
+            );
+            assert!(distinct_sizes.contains(&px(14.0)));
+            assert!(distinct_sizes.contains(&px(24.0)));
+
+            // 2. Hitbox metadata validation: exactly 1 interactive hitbox
+            let interactive_frame = cx
+                .render_frame(size(px(200.0), px(150.0)), scale, |_window, cx| {
+                    cx.new(|_| InteractiveAndInertView)
+                })
+                .expect("render interactive frame");
+
+            let hitboxes = interactive_frame.hitboxes();
+            assert_eq!(
+                hitboxes.len(),
+                1,
+                "must report exactly 1 hitbox for 1 interactive and 1 inert element, found {hitboxes:?}"
+            );
+            assert!(
+                hitboxes[0].size.width == px(60.0) && hitboxes[0].size.height == px(30.0),
+                "hitbox bounds must match interactive element, got {:?}",
+                hitboxes[0]
+            );
+
+            // 3. Empty frame validation: empty lists distinguishable from unpopulated
+            let empty_frame = cx
+                .render_frame(size(px(200.0), px(150.0)), scale, |_window, cx| {
+                    cx.new(|_| EmptyView)
+                })
+                .expect("render empty frame");
+
+            assert_eq!(empty_frame.text_runs().len(), 0);
+            assert_eq!(empty_frame.hitboxes().len(), 0);
+        }
+    }
 }

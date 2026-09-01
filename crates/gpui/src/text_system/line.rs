@@ -352,13 +352,17 @@ fn paint_line(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let line_bounds = Bounds::new(
-        origin,
-        size(
-            layout.width,
-            line_height * (wrap_boundaries.len() as f32 + 1.),
-        ),
-    );
+    let line_height_val = if line_height > px(0.0) {
+        line_height
+    } else {
+        layout.ascent + layout.descent
+    };
+    let total_height = line_height_val * (wrap_boundaries.len() as f32 + 1.);
+    let line_bounds = Bounds::new(origin, size(layout.width, total_height));
+    window.record_text_run(crate::TextRunLayout {
+        font_size: layout.font_size,
+        bounds: line_bounds,
+    });
     window.paint_layer(line_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);

@@ -1233,7 +1233,10 @@ mod tests {
 
         // Check that non-zero forward velocity is retained on reversal
         let vel_after_reversal = handle.velocity().unwrap();
-        assert!(vel_after_reversal > 0.0, "velocity must remain non-zero on interruption");
+        assert!(
+            vel_after_reversal > 0.0,
+            "velocity must remain non-zero on interruption"
+        );
 
         // Step a small delta; forward inertia carries it strictly past the interruption point
         cx.executor().advance_clock(Duration::from_millis(5));
