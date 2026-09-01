@@ -6,7 +6,7 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -4096,6 +4096,35 @@ impl Window {
                 transformation: self.transformation,
             });
         }
+    }
+
+    /// Paint a backdrop blur primitive that samples and blurs the rendered framebuffer
+    /// behind the element's bounds, clipped to its corner radii, and applies saturation and tint.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        saturation: f32,
+        tint: Hsla,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
+        let snapped_bounds = self.snap_bounds(bounds);
+        self.next_frame.scene.insert_primitive(BackdropBlur {
+            order: 0,
+            pad: 0,
+            bounds: snapped_bounds,
+            content_mask,
+            corner_radii: corner_radii.scale(scale_factor),
+            blur_radius: blur_radius.scale(scale_factor),
+            saturation,
+            tint: tint.opacity(opacity),
+            transformation: self.transformation,
+        });
     }
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
         let radii = &quad.corner_radii;

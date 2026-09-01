@@ -314,6 +314,14 @@ pub struct Style {
 
     /// The transformation to apply to this element
     pub transformation: Option<Transformation>,
+    /// The backdrop blur radius of this element
+    pub backdrop_blur: Option<Pixels>,
+
+    /// The backdrop saturation multiplier of this element
+    pub backdrop_saturation: Option<f32>,
+
+    /// The backdrop tint color overlay of this element
+    pub backdrop_tint: Option<Hsla>,
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -722,6 +730,18 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
+        if let Some(blur_radius) = self.backdrop_blur {
+            if blur_radius > px(0.) {
+                window.paint_backdrop_blur(
+                    bounds,
+                    corner_radii,
+                    blur_radius,
+                    self.backdrop_saturation.unwrap_or(1.0),
+                    self.backdrop_tint.unwrap_or_default(),
+                );
+            }
+        }
+
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
@@ -827,6 +847,9 @@ impl Default for Style {
             grid_cols: None,
             grid_location: None,
             transformation: None,
+            backdrop_blur: None,
+            backdrop_saturation: None,
+            backdrop_tint: None,
             debug: false,
             #[cfg(debug_assertions)]
             debug_below: false,
@@ -1538,5 +1561,23 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+
+    #[test]
+    fn test_backdrop_blur_style_refinement() {
+        let mut style = Style::default();
+        assert_eq!(style.backdrop_blur, None);
+        assert_eq!(style.backdrop_saturation, None);
+        assert_eq!(style.backdrop_tint, None);
+
+        let mut refinement = StyleRefinement::default();
+        refinement.backdrop_blur = Some(px(15.0));
+        refinement.backdrop_saturation = Some(1.25);
+        refinement.backdrop_tint = Some(red());
+
+        style.refine(&refinement);
+        assert_eq!(style.backdrop_blur, Some(px(15.0)));
+        assert_eq!(style.backdrop_saturation, Some(1.25));
+        assert_eq!(style.backdrop_tint, Some(red()));
     }
 }

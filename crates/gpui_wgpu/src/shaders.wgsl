@@ -1375,3 +1375,107 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+// --- backdrop blur --- //
+
+struct BackdropBlur {
+    order: u32,
+    pad: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    blur_radius: f32,
+    saturation: f32,
+    tint: Hsla,
+    transformation: TransformationMatrix,
+}
+
+struct BackdropBlurVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) blur_id: u32,
+    @location(1) clip_distances: vec4<f32>,
+    @location(2) local_position: vec2<f32>,
+    @location(3) @interpolate(flat) tint_rgba: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop_blur(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> BackdropBlurVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let blur = load_backdrop_blur(instance_id);
+
+    var out = BackdropBlurVarying();
+    out.position = to_device_position_transformed(unit_vertex, blur.bounds, blur.transformation);
+    out.blur_id = instance_id;
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, blur.bounds, blur.content_mask, blur.transformation);
+    out.local_position = unit_vertex * blur.bounds.size + blur.bounds.origin;
+    out.tint_rgba = hsla_to_rgba(blur.tint);
+    return out;
+}
+
+@fragment
+fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let blur = load_backdrop_blur(input.blur_id);
+    let distance = quad_sdf(input.local_position, blur.bounds, blur.corner_radii);
+    let mask = saturate(0.5 - distance);
+    if (mask <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let uv = input.position.xy / globals.viewport_size;
+    let r = blur.blur_radius;
+
+    var color: vec4<f32>;
+    if (r <= 0.0) {
+        color = textureSample(t_sprite, s_sprite, uv);
+    } else {
+        let texel = vec2<f32>(r) / globals.viewport_size;
+        var sum = textureSample(t_sprite, s_sprite, uv) * 1.0;
+        var weight = 1.0;
+
+        let pi = 3.14159265359;
+        // Ring 1 (r * 0.38)
+        let w1 = 0.637;
+        let r1 = 0.38;
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            let theta = f32(i) * (pi / 4.0);
+            let offset = vec2<f32>(cos(theta), sin(theta)) * r1 * texel;
+            sum = sum + textureSample(t_sprite, s_sprite, uv + offset) * w1;
+            weight = weight + w1;
+        }
+
+        // Ring 2 (r * 0.70)
+        let w2 = 0.216;
+        let r2 = 0.70;
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            let theta = (f32(i) + 0.5) * (pi / 4.0);
+            let offset = vec2<f32>(cos(theta), sin(theta)) * r2 * texel;
+            sum = sum + textureSample(t_sprite, s_sprite, uv + offset) * w2;
+            weight = weight + w2;
+        }
+
+        // Ring 3 (r * 1.00)
+        let w3 = 0.044;
+        let r3 = 1.00;
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            let theta = f32(i) * (pi / 4.0);
+            let offset = vec2<f32>(cos(theta), sin(theta)) * r3 * texel;
+            sum = sum + textureSample(t_sprite, s_sprite, uv + offset) * w3;
+            weight = weight + w3;
+        }
+
+        color = sum / weight;
+    }
+
+    // Saturation adjustment
+    let lum = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let saturated = clamp(vec3<f32>(lum) + blur.saturation * (color.rgb - vec3<f32>(lum)), vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Tint blend
+    let tint = input.tint_rgba;
+    let blended = mix(saturated, tint.rgb, tint.a);
+
+    return blend_color(vec4<f32>(blended, color.a), mask);
+}

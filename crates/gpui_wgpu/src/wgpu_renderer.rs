@@ -133,6 +133,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    backdrop_blur: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -153,6 +154,7 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    backdrop_blurs: InstanceBinding,
 }
 
 struct WgpuBindGroupLayouts {
@@ -203,6 +205,8 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    backdrop_texture: Option<wgpu::Texture>,
+    backdrop_view: Option<wgpu::TextureView>,
 }
 
 impl WgpuResources {
@@ -211,6 +215,8 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.backdrop_texture = None;
+        self.backdrop_view = None;
     }
 }
 
@@ -485,7 +491,19 @@ impl WgpuRenderer {
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: match &target {
+                WgpuRenderTarget::Surface(surface) => {
+                    let surface_caps = surface.get_capabilities(&context.adapter);
+                    if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+                        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+                    } else {
+                        wgpu::TextureUsages::RENDER_ATTACHMENT
+                    }
+                }
+                WgpuRenderTarget::Offscreen { .. } => {
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+                }
+            },
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -656,6 +674,8 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            backdrop_texture: None,
+            backdrop_view: None,
         };
 
         Ok(Self {
@@ -1130,6 +1150,19 @@ impl WgpuRenderer {
             &layouts.surfaces,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let backdrop_blur = create_pipeline(
+            "backdrop_blur",
+            "vs_backdrop_blur",
+            "fs_backdrop_blur",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
@@ -1145,6 +1178,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            backdrop_blur,
         }
     }
 
@@ -1303,6 +1337,27 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+
+        let (backdrop_texture, backdrop_view) = {
+            let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("backdrop_texture"),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        };
+        resources.backdrop_texture = Some(backdrop_texture);
+        resources.backdrop_view = Some(backdrop_view);
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1508,7 +1563,12 @@ impl WgpuRenderer {
             );
         }
 
-        if let Err(error) = self.record_frame(scene, &frame_view) {
+        let surface_texture = match &acquired_frame {
+            AcquiredFrame::Surface(frame) => Some(&frame.texture),
+            AcquiredFrame::Offscreen => None,
+        };
+
+        if let Err(error) = self.record_frame(scene, &frame_view, surface_texture) {
             log::error!("{error:#}");
             self.resources().queue.submit(std::iter::empty());
             return false;
@@ -1520,7 +1580,12 @@ impl WgpuRenderer {
         }
         true
     }
-    fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+    fn record_frame(
+        &mut self,
+        scene: &Scene,
+        frame_view: &wgpu::TextureView,
+        surface_texture: Option<&wgpu::Texture>,
+    ) -> Result<()> {
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1647,6 +1712,95 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::BackdropBlurs(range) => {
+                        let backdrop_blurs = &scene.backdrop_blurs[range.clone()];
+                        if backdrop_blurs.is_empty() {
+                            continue;
+                        }
+
+                        drop(pass);
+
+                        let resources = self.resources();
+                        let frame_texture = surface_texture.or_else(|| match &resources.target {
+                            WgpuRenderTarget::Offscreen { texture, .. } => Some(texture),
+                            WgpuRenderTarget::Surface(_) => None,
+                        });
+                        if let (Some(frame_tex), Some(backdrop_tex), Some(backdrop_view)) = (
+                            frame_texture,
+                            resources.backdrop_texture.as_ref(),
+                            resources.backdrop_view.as_ref(),
+                        ) {
+                            encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: frame_tex,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: backdrop_tex,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d {
+                                    width: self.surface_config.width,
+                                    height: self.surface_config.height,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+
+                            let backdrop_bind_group = self.create_texture_bind_group(
+                                "backdrop_bind_group",
+                                backdrop_view,
+                            );
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_backdrop_blur"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            let instances = &instance_bindings.backdrop_blurs;
+                            let pipeline = &self.resources().pipelines.backdrop_blur;
+                            let range = instance_range(range);
+                            if !range.is_empty() {
+                                pass.set_pipeline(pipeline);
+                                pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+                                pass.set_bind_group(1, &instances.bind_group, &[]);
+                                pass.set_bind_group(2, &backdrop_bind_group, &[]);
+                                pass.draw(
+                                    0..4,
+                                    instances.first_instance + range.start
+                                        ..instances.first_instance + range.end,
+                                );
+                            }
+                        } else {
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1692,6 +1846,11 @@ impl WgpuRenderer {
                 "polychrome_sprites_bind_group",
                 instance_offset,
                 &scene.polychrome_sprites,
+            )?,
+            backdrop_blurs: self.write_instance_binding(
+                "backdrop_blurs_bind_group",
+                instance_offset,
+                &scene.backdrop_blurs,
             )?,
         })
     }
@@ -3614,6 +3773,278 @@ mod tests {
             assert!(
                 blur_interior[3] < 30,
                 "blurred inset shadow must attenuate in deep interior, got {blur_interior:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_backdrop_blur_primitive_and_sampling_behind_element_at_scale_factors() {
+        use gpui::{
+            BackdropBlur, Bounds, ContentMask, Corners, Edges, Hsla, Point, ScaledPixels, Scene,
+            Size,
+        };
+
+        for scale in [1.0, 2.0] {
+            let width = (100.0 * scale) as i32;
+            let height = (100.0 * scale) as i32;
+
+            let instance = WgpuContext::surfaceless_instance();
+            let context =
+                WgpuContext::new_surfaceless(instance, None).expect("surfaceless context");
+            let size_device = gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height));
+            let mut renderer =
+                WgpuRenderer::new_offscreen(&context, size_device).expect("renderer");
+
+            // Build scene with high-frequency vertical stripes (2px wide) from x=0 to x=100
+            let mut scene = Scene::default();
+            for i in 0..50 {
+                let x = (i * 2) as f32;
+                let color = if i % 2 == 0 {
+                    Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 1.0,
+                        a: 1.0,
+                    } // White
+                } else {
+                    Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: 1.0,
+                    } // Black
+                };
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: Default::default(),
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(x * scale),
+                            y: ScaledPixels(0.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(2.0 * scale),
+                            height: ScaledPixels(100.0 * scale),
+                        },
+                    },
+                    content_mask: ContentMask {
+                        bounds: Bounds {
+                            origin: Point {
+                                x: ScaledPixels(0.0),
+                                y: ScaledPixels(0.0),
+                            },
+                            size: Size {
+                                width: ScaledPixels(100.0 * scale),
+                                height: ScaledPixels(100.0 * scale),
+                            },
+                        },
+                    },
+                    background: gpui::solid_background(color),
+                    border_color: Hsla::default(),
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                    transformation: TransformationMatrix::unit(),
+                });
+            }
+
+            // Overlay a backdrop blur pane on the right half (x: 50..100)
+            // with 10px logical blur radius (which scales to 10*scale physical pixels)
+            scene.insert_primitive(BackdropBlur {
+                order: 1,
+                pad: 0,
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(50.0 * scale),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(50.0 * scale),
+                        height: ScaledPixels(100.0 * scale),
+                    },
+                },
+                content_mask: ContentMask {
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(0.0),
+                            y: ScaledPixels(0.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(100.0 * scale),
+                            height: ScaledPixels(100.0 * scale),
+                        },
+                    },
+                },
+                corner_radii: Corners::default(),
+                blur_radius: ScaledPixels(10.0 * scale),
+                saturation: 1.0,
+                tint: Hsla::default(),
+                transformation: TransformationMatrix::unit(),
+            });
+            scene.finish();
+            assert!(renderer.draw(&scene));
+            let bytes = renderer.read_pixels().expect("read pixels");
+            let pitch = (100.0 * scale) as usize * 4;
+            let pixel_at = |lx: f32, ly: f32| -> [u8; 4] {
+                let px = (lx * scale) as usize;
+                let py = (ly * scale) as usize;
+                let offset = py * pitch + px * 4;
+                [
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]
+            };
+
+            // 1. Uncovered left half: high-frequency pattern remains exact and unblurred
+            // At x=12 (even stripe index 6 -> white) and x=10 (odd stripe index 5 -> black)
+            let unblurred_white = pixel_at(12.0, 50.0);
+            let unblurred_black = pixel_at(10.0, 50.0);
+            assert!(
+                unblurred_white[0] > 230 && unblurred_white[1] > 230 && unblurred_white[2] > 230,
+                "uncovered white stripe must stay white at scale {scale}, got {unblurred_white:?}"
+            );
+            assert!(
+                unblurred_black[0] < 25 && unblurred_black[1] < 25 && unblurred_black[2] < 25,
+                "uncovered black stripe must stay black at scale {scale}, got {unblurred_black:?}"
+            );
+
+            // 2. Blurred right half: pixels in interior are smoothed average of pattern underneath
+            // Low variance: every pixel in the interior of the blurred pane should be ~128 (gray)
+            let mut blurred_vals = Vec::new();
+            for lx in 65..85 {
+                let p = pixel_at(lx as f32, 50.0);
+                blurred_vals.push(p[0] as f32);
+            }
+            let mean: f32 = blurred_vals.iter().sum::<f32>() / (blurred_vals.len() as f32);
+            let variance: f32 = blurred_vals
+                .iter()
+                .map(|v| (v - mean) * (v - mean))
+                .sum::<f32>()
+                / (blurred_vals.len() as f32);
+            let mut unblurred_vals = Vec::new();
+            for lx in 15..35 {
+                let p = pixel_at(lx as f32, 50.0);
+                unblurred_vals.push(p[0] as f32);
+            }
+            let unblurred_mean: f32 =
+                unblurred_vals.iter().sum::<f32>() / (unblurred_vals.len() as f32);
+            let unblurred_variance: f32 = unblurred_vals
+                .iter()
+                .map(|v| (v - unblurred_mean) * (v - unblurred_mean))
+                .sum::<f32>()
+                / (unblurred_vals.len() as f32);
+
+            assert!(
+                unblurred_variance > 15000.0,
+                "unblurred region variance must be high (>15000) across stripes at scale {scale}, got {unblurred_variance}"
+            );
+            assert!(
+                variance < unblurred_variance * 0.10,
+                "blurred region variance ({variance}) must be a small fraction (<10%) of unblurred variance ({unblurred_variance}) at scale {scale}"
+            );
+
+            // 3. Test saturation: with colored background, saturation=0.0 desaturates to grayscale
+            let mut sat_scene = Scene::default();
+            // Solid red background
+            sat_scene.insert_primitive(Quad {
+                order: 0,
+                border_style: Default::default(),
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(100.0 * scale),
+                        height: ScaledPixels(100.0 * scale),
+                    },
+                },
+                content_mask: ContentMask {
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(0.0),
+                            y: ScaledPixels(0.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(100.0 * scale),
+                            height: ScaledPixels(100.0 * scale),
+                        },
+                    },
+                },
+                background: gpui::solid_background(Hsla {
+                    h: 0.0,
+                    s: 1.0,
+                    l: 0.5,
+                    a: 1.0,
+                }),
+                border_color: Hsla::default(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+                transformation: TransformationMatrix::unit(),
+            });
+
+            // Grayscale blur pane over right half with saturation=0.0
+            sat_scene.insert_primitive(BackdropBlur {
+                order: 1,
+                pad: 0,
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(50.0 * scale),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(50.0 * scale),
+                        height: ScaledPixels(100.0 * scale),
+                    },
+                },
+                content_mask: ContentMask {
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(0.0),
+                            y: ScaledPixels(0.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(100.0 * scale),
+                            height: ScaledPixels(100.0 * scale),
+                        },
+                    },
+                },
+                corner_radii: Corners::default(),
+                blur_radius: ScaledPixels(5.0 * scale),
+                saturation: 0.0,
+                tint: Hsla::default(),
+                transformation: TransformationMatrix::unit(),
+            });
+
+            assert!(renderer.draw(&sat_scene));
+            let sat_bytes = renderer.read_pixels().expect("read pixels");
+            let sat_pixel_at = |lx: f32, ly: f32| -> [u8; 4] {
+                let px = (lx * scale) as usize;
+                let py = (ly * scale) as usize;
+                let offset = py * pitch + px * 4;
+                [
+                    sat_bytes[offset],
+                    sat_bytes[offset + 1],
+                    sat_bytes[offset + 2],
+                    sat_bytes[offset + 3],
+                ]
+            };
+
+            // Uncovered left half remains vivid red
+            let vivid_red = sat_pixel_at(25.0, 50.0);
+            assert!(
+                vivid_red[0] > 200 && vivid_red[1] < 30 && vivid_red[2] < 30,
+                "uncovered red background must stay red at scale {scale}, got {vivid_red:?}"
+            );
+
+            // Blurred right half with saturation=0.0 must be grayscale (R == G == B)
+            let desat = sat_pixel_at(75.0, 50.0);
+            let diff_rg = (desat[0] as i32 - desat[1] as i32).abs();
+            let diff_gb = (desat[1] as i32 - desat[2] as i32).abs();
+            assert!(
+                diff_rg < 5 && diff_gb < 5 && desat[0] > 30,
+                "saturation=0.0 blur pane must convert colored background to grayscale at scale {scale}, got {desat:?}"
             );
         }
     }

@@ -224,3 +224,18 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_transformation(&cursor),
     );
 }
+
+fn load_backdrop_blur(instance_id: u32) -> BackdropBlur {
+    var cursor = instance_cursor(instance_id * 26u);
+    return BackdropBlur(
+        read_word(&cursor),
+        read_word(&cursor),
+        read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_corners(&cursor),
+        read_f32(&cursor),
+        read_f32(&cursor),
+        read_hsla(&cursor),
+        read_transformation(&cursor),
+    );
+}

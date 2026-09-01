@@ -961,4 +961,22 @@ pub trait Styled: Sized {
         self.style().transformation = Some(transformation);
         self
     }
+
+    /// Sets the backdrop blur radius.
+    fn backdrop_blur(mut self, blur_radius: impl Into<Pixels>) -> Self {
+        self.style().backdrop_blur = Some(blur_radius.into());
+        self
+    }
+
+    /// Sets the backdrop saturation multiplier (e.g. 1.0 = normal, 1.25 = vibrant).
+    fn backdrop_saturation(mut self, saturation: f32) -> Self {
+        self.style().backdrop_saturation = Some(saturation);
+        self
+    }
+
+    /// Sets the backdrop tint color overlay.
+    fn backdrop_tint(mut self, tint: impl Into<Hsla>) -> Self {
+        self.style().backdrop_tint = Some(tint.into());
+        self
+    }
 }
