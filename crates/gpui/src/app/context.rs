@@ -237,8 +237,7 @@ impl<'a, T: 'static> Context<'a, T> {
     /// change is confined to one element whose bounds are known, such as an
     /// entry appended to a list.
     pub fn notify_within(&mut self, bounds: Bounds<Pixels>) {
-        self.app
-            .notify_within(self.entity_state.entity_id, bounds);
+        self.app.notify_within(self.entity_state.entity_id, bounds);
     }
 
     /// Spawn the future returned by the given function.

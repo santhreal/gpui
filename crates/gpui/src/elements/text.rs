@@ -1317,13 +1317,12 @@ mod tests {
 
     impl Render for TruncatedRowsView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .flex()
-                .flex_col()
-                .w(px(256.0))
-                .children(self.rows.iter().cloned().map(|row_text| {
-                    div().w_full().truncate().child(row_text)
-                }))
+            div().flex().flex_col().w(px(256.0)).children(
+                self.rows
+                    .iter()
+                    .cloned()
+                    .map(|row_text| div().w_full().truncate().child(row_text)),
+            )
         }
     }
 
@@ -1336,9 +1335,8 @@ mod tests {
             .map(|i| format!("Row {:02}: item text", i))
             .collect();
 
-        let (view, cx) = cx.add_window_view(|_window, _cx| TruncatedRowsView {
-            rows: rows.clone(),
-        });
+        let (view, cx) =
+            cx.add_window_view(|_window, _cx| TruncatedRowsView { rows: rows.clone() });
 
         let frame_1_calls = text_system.shaping_calls();
         assert_eq!(
@@ -1368,9 +1366,8 @@ mod tests {
             .map(|i| format!("Row {:02}: item text", i))
             .collect();
 
-        let (view, cx) = cx.add_window_view(|_window, _cx| TruncatedRowsView {
-            rows: rows.clone(),
-        });
+        let (view, cx) =
+            cx.add_window_view(|_window, _cx| TruncatedRowsView { rows: rows.clone() });
 
         assert_eq!(text_system.shaping_calls(), 40);
 
@@ -1404,13 +1401,10 @@ mod tests {
         text_system.set_advance_cache_capacity(10);
         text_system.reset_shaping_calls();
 
-        let rows: Vec<String> = (0..10)
-            .map(|i| format!("Row {:02}: item", i))
-            .collect();
+        let rows: Vec<String> = (0..10).map(|i| format!("Row {:02}: item", i)).collect();
 
-        let (view, cx) = cx.add_window_view(|_window, _cx| TruncatedRowsView {
-            rows: rows.clone(),
-        });
+        let (view, cx) =
+            cx.add_window_view(|_window, _cx| TruncatedRowsView { rows: rows.clone() });
 
         assert_eq!(text_system.shaping_calls(), 10);
 

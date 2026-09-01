@@ -206,7 +206,11 @@ impl Scene {
         let bounds = self
             .start_path_clips
             .last()
-            .map(|c| c.path.transformation.apply_to_bounds(c.path.clipped_bounds()))
+            .map(|c| {
+                c.path
+                    .transformation
+                    .apply_to_bounds(c.path.clipped_bounds())
+            })
             .unwrap_or_default();
         let key = self.key_for(bounds);
         let index = self.end_path_clips.len() as u32;
@@ -239,15 +243,17 @@ impl Scene {
             Primitive::Quad(_) => (PrimitiveKind::Quad, self.quads.len()),
             Primitive::Path(_) => (PrimitiveKind::Path, self.paths.len()),
             Primitive::Underline(_) => (PrimitiveKind::Underline, self.underlines.len()),
-            Primitive::MonochromeSprite(_) => {
-                (PrimitiveKind::MonochromeSprite, self.monochrome_sprites.len())
-            }
+            Primitive::MonochromeSprite(_) => (
+                PrimitiveKind::MonochromeSprite,
+                self.monochrome_sprites.len(),
+            ),
             Primitive::SubpixelSprite(_) => {
                 (PrimitiveKind::SubpixelSprite, self.subpixel_sprites.len())
             }
-            Primitive::PolychromeSprite(_) => {
-                (PrimitiveKind::PolychromeSprite, self.polychrome_sprites.len())
-            }
+            Primitive::PolychromeSprite(_) => (
+                PrimitiveKind::PolychromeSprite,
+                self.polychrome_sprites.len(),
+            ),
             Primitive::Surface(_) => (PrimitiveKind::Surface, self.surfaces.len()),
             Primitive::BackdropBlur(_) => (PrimitiveKind::BackdropBlur, self.backdrop_blurs.len()),
         };
@@ -1546,7 +1552,12 @@ mod tests {
             batch_kinds(&scene),
             vec![(PrimitiveKind::Quad, 2), (PrimitiveKind::Surface, 1)]
         );
-        assert!(scene.quads.iter().all(|q| q.order < scene.surfaces[0].order));
+        assert!(
+            scene
+                .quads
+                .iter()
+                .all(|q| q.order < scene.surfaces[0].order)
+        );
     }
 
     /// A negative z-index sinks below the scope's unindexed primitives, even
@@ -1656,7 +1667,11 @@ mod tests {
         let batches = scene.batches().collect::<Vec<_>>();
         assert_eq!(batches.len(), 3, "batches: {:?}", batches);
         match (&batches[0], &batches[1], &batches[2]) {
-            (PrimitiveBatch::StartPathClip(_), PrimitiveBatch::Quads(range), PrimitiveBatch::EndPathClip) => {
+            (
+                PrimitiveBatch::StartPathClip(_),
+                PrimitiveBatch::Quads(range),
+                PrimitiveBatch::EndPathClip,
+            ) => {
                 assert_eq!(range.len(), 1);
             }
             other => panic!("unexpected batches: {:?}", other),

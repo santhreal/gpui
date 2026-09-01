@@ -2134,7 +2134,10 @@ impl ContentMask<Pixels> {
             bottom_left: corner_radii.bottom_left.min(max_radius).max(px(0.0)),
         };
 
-        ContentMask { bounds, corner_radii }
+        ContentMask {
+            bounds,
+            corner_radii,
+        }
     }
 }
 
@@ -2164,9 +2167,18 @@ impl ContentMask<ScaledPixels> {
         let max_radius = max_radius_x.min(max_radius_y);
         let corner_radii = Corners {
             top_left: corner_radii.top_left.min(max_radius).max(ScaledPixels(0.0)),
-            top_right: corner_radii.top_right.min(max_radius).max(ScaledPixels(0.0)),
-            bottom_right: corner_radii.bottom_right.min(max_radius).max(ScaledPixels(0.0)),
-            bottom_left: corner_radii.bottom_left.min(max_radius).max(ScaledPixels(0.0)),
+            top_right: corner_radii
+                .top_right
+                .min(max_radius)
+                .max(ScaledPixels(0.0)),
+            bottom_right: corner_radii
+                .bottom_right
+                .min(max_radius)
+                .max(ScaledPixels(0.0)),
+            bottom_left: corner_radii
+                .bottom_left
+                .min(max_radius)
+                .max(ScaledPixels(0.0)),
         };
 
         Self {
@@ -8151,7 +8163,11 @@ mod tests {
                     window.refresh();
                 })
                 .unwrap();
-            assert_eq!(last_frame_damage(&window, cx), None, "refresh beside a declaration");
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                None,
+                "refresh beside a declaration"
+            );
 
             window
                 .update(cx, |_, window, cx| {
@@ -8159,7 +8175,11 @@ mod tests {
                     cx.notify();
                 })
                 .unwrap();
-            assert_eq!(last_frame_damage(&window, cx), None, "notify beside a declaration");
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                None,
+                "notify beside a declaration"
+            );
 
             window
                 .update(cx, |_, window, _| {
@@ -8178,7 +8198,11 @@ mod tests {
                     window.bounds_changed(cx);
                 })
                 .unwrap();
-            assert_eq!(last_frame_damage(&window, cx), None, "resize beside a declaration");
+            assert_eq!(
+                last_frame_damage(&window, cx),
+                None,
+                "resize beside a declaration"
+            );
         }
 
         #[gpui::test]
@@ -8238,7 +8262,9 @@ mod tests {
             });
 
             window
-                .update(cx, |_, _, cx| cx.notify_within(bounds(0.0, 50.0, 200.0, 50.0)))
+                .update(cx, |_, _, cx| {
+                    cx.notify_within(bounds(0.0, 50.0, 200.0, 50.0))
+                })
                 .unwrap();
             assert_eq!(
                 last_frame_damage(&window, cx),
@@ -8270,14 +8296,16 @@ mod tests {
         fn an_unscoped_notify_raised_while_drawing_makes_the_next_frame_whole(
             cx: &mut TestAppContext,
         ) {
-            let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| {
-                NotifiesWhileDrawing { renders: 0 }
+            let window = cx.open_window(size(px(800.0), px(600.0)), |_, _| NotifiesWhileDrawing {
+                renders: 0,
             });
             cx.run_until_parked();
             assert_eq!(last_frame_damage(&window, cx), None, "mount");
 
             window
-                .update(cx, |_, _, cx| cx.notify_within(bounds(0.0, 0.0, 10.0, 10.0)))
+                .update(cx, |_, _, cx| {
+                    cx.notify_within(bounds(0.0, 0.0, 10.0, 10.0))
+                })
                 .unwrap();
             assert_eq!(
                 last_frame_damage(&window, cx),
@@ -8329,9 +8357,7 @@ mod tests {
         }
 
         #[gpui::test]
-        fn a_mounted_animation_repaints_only_where_it_was_and_where_it_is(
-            cx: &mut TestAppContext,
-        ) {
+        fn a_mounted_animation_repaints_only_where_it_was_and_where_it_is(cx: &mut TestAppContext) {
             let offset = Rc::new(Cell::new(0.0));
             let window = cx.open_window(size(px(400.0), px(400.0)), {
                 let offset = offset.clone();

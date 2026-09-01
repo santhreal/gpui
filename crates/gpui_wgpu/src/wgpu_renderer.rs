@@ -2,8 +2,8 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, TransformationMatrix, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -584,9 +584,9 @@ impl WgpuRenderer {
             usage: match &target {
                 WgpuRenderTarget::Surface(surface) => {
                     let surface_caps = surface.get_capabilities(&context.adapter);
-                    let copyable = surface_caps
-                        .usages
-                        .intersection(wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST);
+                    let copyable = surface_caps.usages.intersection(
+                        wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                    );
                     wgpu::TextureUsages::RENDER_ATTACHMENT | copyable
                 }
                 WgpuRenderTarget::Offscreen { .. } => {
@@ -1810,10 +1810,12 @@ impl WgpuRenderer {
         surface_texture: Option<&wgpu::Texture>,
     ) -> Result<()> {
         let extent = match scene.damage {
-            Some(damage) if self.resources().retained_valid => {
-                Scissor::from_damage(damage, self.surface_config.width, self.surface_config.height)
-                    .map_or(FrameExtent::Nothing, FrameExtent::Partial)
-            }
+            Some(damage) if self.resources().retained_valid => Scissor::from_damage(
+                damage,
+                self.surface_config.width,
+                self.surface_config.height,
+            )
+            .map_or(FrameExtent::Nothing, FrameExtent::Partial),
             _ => FrameExtent::Whole,
         };
         let scissor = match extent {
@@ -1991,11 +1993,7 @@ impl WgpuRenderer {
                             scissor,
                         );
                         if let Some(path) = active_path_clip.take() {
-                            self.draw_path_clip_composite(
-                                &path,
-                                &mut instance_offset,
-                                &mut pass,
-                            )?;
+                            self.draw_path_clip_composite(&path, &mut instance_offset, &mut pass)?;
                         }
                     }
                     PrimitiveBatch::BackdropBlurs(range) => {
@@ -2405,10 +2403,8 @@ impl WgpuRenderer {
             "clip_intermediate_texture_bind_group",
             &clip_intermediate_view,
         );
-        let path_mask_bind = self.create_texture_bind_group(
-            "path_mask_texture_bind_group",
-            &path_intermediate_view,
-        );
+        let path_mask_bind =
+            self.create_texture_bind_group("path_mask_texture_bind_group", &path_intermediate_view);
 
         let resources = self.resources();
         pass.set_pipeline(&resources.pipelines.path_mask_composite);
@@ -3082,9 +3078,9 @@ mod tests {
                         width: ScaledPixels(x + width + 100.0),
                         height: ScaledPixels(height + 100.0),
                     },
-                    },
-                    corner_radii: Default::default(),
                 },
+                corner_radii: Default::default(),
+            },
             background: solid_background(Hsla {
                 h: hue,
                 s: 1.0,
@@ -3171,7 +3167,10 @@ mod tests {
         let bytes = renderer.read_pixels().expect("read pixels");
         assert!(is_red(pixel(&bytes, width, 50, 50)), "outside the rect");
         assert!(is_red(pixel(&bytes, width, 99, 50)), "last column outside");
-        assert!(is_blue(pixel(&bytes, width, 100, 50)), "first column inside");
+        assert!(
+            is_blue(pixel(&bytes, width, 100, 50)),
+            "first column inside"
+        );
         assert!(is_blue(pixel(&bytes, width, 150, 50)), "inside the rect");
 
         // An empty rect draws nothing and changes nothing.
@@ -3760,9 +3759,9 @@ mod tests {
             bounds: gpui::Bounds::new(
                 gpui::point(px(0.0), px(0.0)),
                 gpui::size(px(160.0), px(100.0)),
-                ),
-                corner_radii: Default::default(),
-            };
+            ),
+            corner_radii: Default::default(),
+        };
         scene_untrans.insert_primitive(path_untrans.scale(1.0));
 
         let mut scene_trans = Scene::default();
@@ -4651,7 +4650,10 @@ mod tests {
             path.line_to(Point::new(px(10.0), px(10.0)));
             path.color = gpui::solid_background(rgb(0xffffff));
             path.content_mask = ContentMask {
-                bounds: Bounds::new(Point::new(px(0.0), px(0.0)), Size::new(px(100.0), px(100.0))),
+                bounds: Bounds::new(
+                    Point::new(px(0.0), px(0.0)),
+                    Size::new(px(100.0), px(100.0)),
+                ),
                 corner_radii: Default::default(),
             };
             let path_scaled = path.scale(scale);
@@ -4703,7 +4705,12 @@ mod tests {
                 let px = (lx * scale) as usize;
                 let py = (ly * scale) as usize;
                 let offset = py * pitch + px * 4;
-                [bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]
+                [
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]
             };
 
             // Inside triangle: (25, 25) must be green

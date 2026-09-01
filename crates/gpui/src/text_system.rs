@@ -25,6 +25,8 @@ use derive_more::{Add, Deref, FromStr, Sub};
 use itertools::Itertools;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::{SmallVec, smallvec};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     borrow::Cow,
     cmp,
@@ -33,8 +35,6 @@ use std::{
     ops::{Deref, DerefMut, Range},
     sync::Arc,
 };
-#[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// An opaque identifier for a specific font.
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
