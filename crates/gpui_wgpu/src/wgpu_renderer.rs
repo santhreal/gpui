@@ -155,6 +155,7 @@ struct WgpuPipelines {
     /// op clears the whole attachment, so a partial frame clears its damaged
     /// region with this instead.
     clear: wgpu::RenderPipeline,
+    present_retained: Option<wgpu::RenderPipeline>,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -230,13 +231,11 @@ struct WgpuResources {
     path_msaa_view: Option<wgpu::TextureView>,
     backdrop_texture: Option<wgpu::Texture>,
     backdrop_view: Option<wgpu::TextureView>,
-    /// The frame as last drawn. Every frame renders here and is copied to
-    /// the acquired target, so a frame that declares damage repaints only
-    /// that region and keeps the rest. `None` when the target cannot be
-    /// copied into, in which case every frame renders the whole viewport
-    /// straight to the target.
+    /// The complete frame, retained independently of swapchain copy support
+    /// so backdrop blur never reads a non-copyable surface texture.
     retained_texture: Option<wgpu::Texture>,
     retained_view: Option<wgpu::TextureView>,
+    retained_present_binding: Option<wgpu::BindGroup>,
     /// Whether `retained_texture` holds a complete frame at the current size.
     retained_valid: bool,
 }
@@ -253,6 +252,7 @@ impl WgpuResources {
         self.backdrop_view = None;
         self.retained_texture = None;
         self.retained_view = None;
+        self.retained_present_binding = None;
         self.retained_valid = false;
     }
 }
@@ -577,9 +577,8 @@ impl WgpuRenderer {
             );
         }
 
-        // COPY_DST lets the retained frame be copied into the target, which
-        // is what makes a partial redraw possible; a surface without it gets
-        // whole frames.
+        // Prefer texture copies for presentation when supported; otherwise
+        // a fullscreen pass presents the retained frame.
         let surface_config = wgpu::SurfaceConfiguration {
             usage: match &target {
                 WgpuRenderTarget::Surface(surface) => {
@@ -629,6 +628,7 @@ impl WgpuRenderer {
             rendering_params.path_sample_count,
             dual_source_blending,
             uses_webgl_instance_data,
+            surface_config.usage.contains(wgpu::TextureUsages::COPY_DST),
         );
 
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -771,6 +771,7 @@ impl WgpuRenderer {
             backdrop_view: None,
             retained_texture: None,
             retained_view: None,
+            retained_present_binding: None,
             retained_valid: false,
         };
 
@@ -984,6 +985,7 @@ impl WgpuRenderer {
         path_sample_count: u32,
         dual_source_blending: bool,
         uses_webgl_instance_data: bool,
+        target_copyable: bool,
     ) -> WgpuPipelines {
         // Diagnostic guard: verify the device actually has
         // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
@@ -1320,42 +1322,57 @@ impl WgpuRenderer {
             bind_group_layouts: &[],
             immediate_size: 0,
         });
-        let clear = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("clear"),
-            layout: Some(&clear_layout),
-            vertex: wgpu::VertexState {
-                module: &shader_module,
-                entry_point: Some("vs_clear"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader_module,
-                entry_point: Some("fs_clear"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview_mask: None,
-            cache: None,
+        let create_fullscreen_pipeline =
+            |name: &str,
+             layout: Option<&wgpu::PipelineLayout>,
+             fragment: &wgpu::ShaderModule,
+             fragment_entry: &str| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(name),
+                    layout,
+                    vertex: wgpu::VertexState {
+                        module: &shader_module,
+                        entry_point: Some("vs_clear"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: fragment,
+                        entry_point: Some(fragment_entry),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: surface_format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: 1,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+        let clear =
+            create_fullscreen_pipeline("clear", Some(&clear_layout), &shader_module, "fs_clear");
+        let present_retained = (!target_copyable).then(|| {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("retained_present_shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
+            });
+            create_fullscreen_pipeline("present_retained", None, &shader, "fs_present")
         });
 
         WgpuPipelines {
@@ -1371,6 +1388,7 @@ impl WgpuRenderer {
             backdrop_blur,
             path_mask_composite,
             clear,
+            present_retained,
         }
     }
 
@@ -1513,10 +1531,6 @@ impl WgpuRenderer {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
         let path_sample_count = self.rendering_params.path_sample_count;
-        let target_is_copyable = self
-            .surface_config
-            .usage
-            .contains(wgpu::TextureUsages::COPY_DST);
         let resources = self.resources_mut();
 
         let (t, v) = Self::create_path_intermediate(&resources.device, format, width, height);
@@ -1561,7 +1575,7 @@ impl WgpuRenderer {
         resources.backdrop_texture = Some(backdrop_texture);
         resources.backdrop_view = Some(backdrop_view);
 
-        if target_is_copyable {
+        {
             let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("retained_frame"),
                 size: wgpu::Extent3d {
@@ -1573,10 +1587,29 @@ impl WgpuRenderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            resources.retained_present_binding =
+                resources
+                    .pipelines
+                    .present_retained
+                    .as_ref()
+                    .map(|pipeline| {
+                        resources
+                            .device
+                            .create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("retained_present_binding"),
+                                layout: &pipeline.get_bind_group_layout(0),
+                                entries: &[wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&view),
+                                }],
+                            })
+                    });
             resources.retained_texture = Some(texture);
             resources.retained_view = Some(view);
             resources.retained_valid = false;
@@ -1614,7 +1647,9 @@ impl WgpuRenderer {
                 path_sample_count,
                 dual_source_blending,
                 uses_webgl_instance_data,
+                surface_config.usage.contains(wgpu::TextureUsages::COPY_DST),
             );
+            resources.invalidate_intermediate_textures();
         }
     }
 
@@ -1831,8 +1866,8 @@ impl WgpuRenderer {
             WgpuRenderTarget::Offscreen { texture, .. } => Some(texture.clone()),
             WgpuRenderTarget::Surface(_) => None,
         };
-        // Frames render into the retained texture when the target can be
-        // copied into, otherwise straight into the target.
+        // Backdrop blur and damage reuse require a readable retained frame,
+        // even when the acquired surface supports only render attachments.
         let target_view = retained_view.as_ref().unwrap_or(frame_view);
         let frame_texture = surface_texture.or(offscreen_texture.as_ref());
         // The texture holding the frame drawn so far, which a backdrop blur
@@ -2069,9 +2104,23 @@ impl WgpuRenderer {
             }
         }
 
-        // The retained frame is complete after any draw into it, so copy it
-        // to the acquired target, whose contents are otherwise undefined.
-        if let (Some(retained_texture), Some(target_texture)) =
+        // Swapchain contents are undefined, so present the complete retained
+        // frame even when only part of it was repainted.
+        if let (Some(pipeline), Some(binding)) = (
+            self.resources().pipelines.present_retained.as_ref(),
+            self.resources().retained_present_binding.as_ref(),
+        ) {
+            let mut pass = Self::begin_frame_pass(
+                &mut encoder,
+                frame_view,
+                "present_retained",
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                None,
+            );
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, binding, &[]);
+            pass.draw(0..3, 0..1);
+        } else if let (Some(retained_texture), Some(target_texture)) =
             (retained_texture.as_ref(), frame_texture)
         {
             encoder.copy_texture_to_texture(
@@ -3103,6 +3152,183 @@ mod tests {
             bytes[offset + 2],
             bytes[offset + 3],
         ]
+    }
+
+    fn set_test_target_usage(
+        renderer: &mut WgpuRenderer,
+        usage: wgpu::TextureUsages,
+        configure_pipeline: bool,
+    ) {
+        renderer.surface_config.usage = usage;
+        let config = renderer.surface_config.clone();
+        let path_sample_count = renderer.rendering_params.path_sample_count;
+        let dual_source_blending = renderer.dual_source_blending;
+        let uses_webgl_instance_data = renderer.uses_webgl_instance_data;
+        let resources = renderer.resources_mut();
+        let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("restricted_test_target"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        resources.target = WgpuRenderTarget::Offscreen {
+            texture,
+            view,
+            format: config.format,
+        };
+        if configure_pipeline {
+            resources.pipelines = WgpuRenderer::create_pipelines(
+                &resources.device,
+                &resources.bind_group_layouts,
+                config.format,
+                config.alpha_mode,
+                path_sample_count,
+                dual_source_blending,
+                uses_webgl_instance_data,
+                usage.contains(wgpu::TextureUsages::COPY_DST),
+            );
+            resources.invalidate_intermediate_textures();
+        }
+    }
+
+    fn blurred_test_frame(size: f32, hue: f32) -> Scene {
+        let mut scene = build_test_quad_scene_with_hue(0.0, size, size, hue);
+        let bounds = gpui::Bounds::new(
+            gpui::Point::default(),
+            gpui::size(ScaledPixels(size), ScaledPixels(size)),
+        );
+        scene.insert_primitive(gpui::BackdropBlur {
+            order: 1,
+            pad: 0,
+            bounds,
+            content_mask: gpui::ContentMask {
+                bounds,
+                corner_radii: Default::default(),
+            },
+            corner_radii: Default::default(),
+            blur_radius: ScaledPixels(2.0),
+            saturation: 1.0,
+            tint: Default::default(),
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+        scene
+    }
+
+    /// WHY: swapchain copy flags are optional. Blur must never copy from a
+    /// render-only target, and presentation must still replace stale pixels.
+    /// Exercises every COPY_SRC/COPY_DST combination, partial and empty damage,
+    /// and resize. Checks target pixels where readback is permitted; render-only
+    /// targets are checked for GPU validation failures and covered by native capture.
+    #[test]
+    fn backdrop_and_presentation_respect_target_copy_capabilities() {
+        let context = WgpuContext::new_surfaceless(WgpuContext::surfaceless_instance(), None)
+            .expect("surfaceless context");
+        let copy_flags = [wgpu::TextureUsages::COPY_SRC, wgpu::TextureUsages::COPY_DST];
+        for combination in 0..(1 << copy_flags.len()) {
+            let usage = copy_flags.iter().enumerate().fold(
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                |usage, (index, flag)| {
+                    if combination & (1 << index) != 0 {
+                        usage | *flag
+                    } else {
+                        usage
+                    }
+                },
+            );
+            let mut renderer = WgpuRenderer::new_offscreen(
+                &context,
+                gpui::size(gpui::DevicePixels(32), gpui::DevicePixels(32)),
+            )
+            .expect("renderer");
+            set_test_target_usage(&mut renderer, usage, true);
+            let mut previous_pixels = None;
+            for step in 0..4 {
+                let mut scene = match step {
+                    0 => blurred_test_frame(32.0, 0.0),
+                    1 => blurred_test_frame(32.0, 2.0 / 3.0),
+                    2 => Scene::default(),
+                    _ => {
+                        renderer.update_drawable_size(gpui::size(
+                            gpui::DevicePixels(16),
+                            gpui::DevicePixels(16),
+                        ));
+                        set_test_target_usage(&mut renderer, usage, false);
+                        blurred_test_frame(16.0, 1.0 / 3.0)
+                    }
+                };
+                if step == 1 {
+                    scene.damage = damage(8.0, 8.0, 16.0, 16.0);
+                }
+                if step == 2 {
+                    scene.damage = damage(0.0, 0.0, 0.0, 0.0);
+                }
+                if step == 3 {
+                    scene.damage = damage(6.0, 6.0, 4.0, 4.0);
+                }
+                // Acquired swapchain contents are undefined, not the previous frame.
+                let resources = renderer.resources();
+                let WgpuRenderTarget::Offscreen { view, .. } = &resources.target else {
+                    panic!("test requires an offscreen target");
+                };
+                let mut encoder =
+                    resources
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("discard_acquired_target"),
+                        });
+                drop(WgpuRenderer::begin_frame_pass(
+                    &mut encoder,
+                    view,
+                    "discard_acquired_target",
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    None,
+                ));
+                resources.queue.submit(std::iter::once(encoder.finish()));
+                assert!(
+                    renderer.draw(&scene),
+                    "{usage:?}, step {step}: submission failed"
+                );
+                renderer
+                    .resources()
+                    .device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(std::time::Duration::from_secs(10)),
+                    })
+                    .expect("bounded GPU completion");
+                assert_eq!(
+                    renderer.last_error.lock().expect("GPU error lock").take(),
+                    None,
+                    "{usage:?}, step {step}",
+                );
+                if usage.contains(wgpu::TextureUsages::COPY_SRC) {
+                    let pixels = renderer.read_pixels().expect("target readback");
+                    match step {
+                        0 => assert_eq!(pixel(&pixels, 32, 16, 16), [255, 0, 0, 255]),
+                        1 => {
+                            assert_eq!(pixel(&pixels, 32, 16, 16), [0, 0, 255, 255]);
+                            assert_eq!(pixel(&pixels, 32, 2, 2), [255, 0, 0, 255]);
+                        }
+                        2 => assert_eq!(Some(&pixels), previous_pixels.as_ref()),
+                        _ => {
+                            assert_eq!(pixel(&pixels, 16, 8, 8), [0, 255, 0, 255]);
+                            assert_eq!(pixel(&pixels, 16, 2, 2), [0, 255, 0, 255]);
+                        }
+                    }
+                    previous_pixels = Some(pixels);
+                }
+            }
+        }
     }
 
     fn damage(x: f32, y: f32, width: f32, height: f32) -> Option<gpui::Bounds<gpui::ScaledPixels>> {

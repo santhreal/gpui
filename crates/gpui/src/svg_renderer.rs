@@ -102,6 +102,14 @@ pub struct SvgRenderer {
 /// scales should retain this value to avoid re-paying the parse cost.
 pub struct ParsedSvg(usvg::Tree);
 
+impl ParsedSvg {
+    /// Returns the intrinsic size of the parsed SVG document in pixels.
+    pub fn size(&self) -> (f32, f32) {
+        let s = self.0.size();
+        (s.width(), s.height())
+    }
+}
+
 /// The size in which to rasterize the SVG.
 #[derive(Clone, Copy)]
 pub enum SvgSize {

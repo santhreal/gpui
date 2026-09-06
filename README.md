@@ -30,8 +30,8 @@ gpui = { git = "ssh://git@github.com/santhreal/gpui.git", rev = "f3b88ebb4251a42
 ```
 
 Use the same revision for companion packages such as `gpui_platform` and
-`gpui_wgpu`. A generated vendor snapshot is a dependency artifact, not another
-maintained fork.
+`gpui_wgpu`. All consuming projects resolve framework packages from this
+repository. Do not copy framework sources into application repositories.
 
 ## Source reference
 
