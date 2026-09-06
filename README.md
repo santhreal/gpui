@@ -1,7 +1,7 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
 
-# GPUI
+# Santh GPUI
 
 A reusable GPU-accelerated UI framework fork derived from
 [Zed](https://github.com/zed-industries/zed).
@@ -26,7 +26,7 @@ Repository access and Git authentication are required. Pin a revision:
 
 ```toml
 [dependencies]
-gpui = { git = "ssh://git@github.com/santhreal/gpui.git", rev = "f3b88ebb4251a420353201e9596f3736413aaa55" }
+gpui = { git = "ssh://git@github.com/santhreal/gpui.git", rev = "d9a8bdbcc23b4c619e186a193d147bcad82b8e69" }
 ```
 
 Use the same revision for companion packages such as `gpui_platform` and
