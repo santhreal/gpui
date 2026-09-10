@@ -92,6 +92,7 @@ impl ShapedLine {
         paint_line(
             origin,
             &self.layout,
+            &self.text,
             line_height,
             align,
             align_width,
@@ -223,6 +224,7 @@ impl LineLayout {
         paint_line(
             origin,
             self,
+            &SharedString::default(),
             line_height,
             align,
             align_width,
@@ -298,6 +300,7 @@ impl WrappedLine {
         paint_line(
             origin,
             &self.layout.unwrapped_layout,
+            &self.text,
             line_height,
             align,
             align_width,
@@ -341,9 +344,11 @@ impl WrappedLine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
+    text: &SharedString,
     line_height: Pixels,
     align: TextAlign,
     align_width: Option<Pixels>,
@@ -362,6 +367,7 @@ fn paint_line(
     window.record_text_run(crate::TextRunLayout {
         font_size: layout.font_size,
         bounds: line_bounds,
+        text: text.clone(),
     });
     window.paint_layer(line_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;

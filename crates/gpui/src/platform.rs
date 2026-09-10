@@ -1002,15 +1002,20 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
 }
 
-/// A shaped text run's font size and bounding box within a rendered frame.
+/// A shaped text run's font size, bounding box and text within a rendered frame.
 ///
-/// Both `font_size` and `bounds` are in logical pixels ([`Pixels`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Both `font_size` and `bounds` are in logical pixels ([`Pixels`]). `text` is
+/// what the run drew, so a caller inspecting a frame can tell one run from
+/// another by its content rather than by its measure alone; a caller painting a
+/// bare [`LineLayout`], which holds no string, records an empty one.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TextRunLayout {
     /// The font size of the text run in logical pixels ([`Pixels`]).
     pub font_size: Pixels,
     /// The bounding box of the text run in logical pixels ([`Pixels`]).
     pub bounds: Bounds<Pixels>,
+    /// The text the run drew.
+    pub text: SharedString,
 }
 
 /// A rasterized headless frame containing RGBA8 pixels and geometry metadata.
