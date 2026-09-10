@@ -4542,14 +4542,27 @@ impl Window {
             return;
         }
 
-        // Splitting a border-only quad around its empty interior avoids shading
-        // every transparent pixel inside large outlines.
+        for quad in Self::border_only_pieces(quad) {
+            self.next_frame.scene.insert_primitive(quad);
+        }
+    }
+
+    /// A border-only quad, split around its empty interior so the renderer does
+    /// not shade every transparent pixel inside a large outline.
+    ///
+    /// Each piece carries one strip of the outline in its content mask. A
+    /// rounded mask is a shape rather than a rectangle, so narrowing its bounds
+    /// to a strip rounds that strip's own corners: the outline loses the ends of
+    /// every edge and the arcs between them, clipped by a corner it never
+    /// reached. A quad under a rounded mask is therefore painted whole.
+    fn border_only_pieces(quad: Quad) -> SmallVec<[Quad; 4]> {
         let outer_bounds = quad.bounds;
         let inner_bounds = Self::largest_border_interior(&quad);
-
-        if inner_bounds.is_empty() {
-            self.next_frame.scene.insert_primitive(quad);
-            return;
+        let mask_is_rectangular = quad.content_mask.corner_radii == Corners::default();
+        let mut pieces = SmallVec::new();
+        if inner_bounds.is_empty() || !mask_is_rectangular {
+            pieces.push(quad);
+            return pieces;
         }
 
         let strips = [
@@ -4574,11 +4587,10 @@ impl Window {
                 point(outer_bounds.right(), inner_bounds.bottom()),
             ),
         ];
-
         for strip in strips {
             let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
             if !content_mask_bounds.is_empty() {
-                self.next_frame.scene.insert_primitive(Quad {
+                pieces.push(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
                         corner_radii: quad.content_mask.corner_radii,
@@ -4587,6 +4599,7 @@ impl Window {
                 });
             }
         }
+        pieces
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
@@ -7419,6 +7432,109 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
         WindowOptions, canvas, div, point, px, size,
     };
+    use crate::{
+        Background, BorderStyle, ContentMask, Corners, Edges, Hsla, Quad, ScaledPixels,
+        TransformationMatrix,
+    };
+
+    /// A 240x48 outline of one pixel, rounded by eight, under `mask`.
+    fn outline_under(mask: ContentMask<ScaledPixels>) -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds::from_corners(
+                point(ScaledPixels(100.0), ScaledPixels(100.0)),
+                point(ScaledPixels(340.0), ScaledPixels(148.0)),
+            ),
+            content_mask: mask,
+            background: Background::default(),
+            border_color: Hsla::white(),
+            corner_radii: Corners::all(ScaledPixels(8.0)),
+            border_widths: Edges::all(ScaledPixels(1.0)),
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    /// The mask every piece of an outline is clipped by, wide enough to hold it.
+    fn window_sized_mask(corner_radii: Corners<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: Bounds::from_corners(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                point(ScaledPixels(1000.0), ScaledPixels(800.0)),
+            ),
+            corner_radii,
+        }
+    }
+
+    /// WHY: the split narrows each piece's mask to one strip of the outline.
+    /// Under a rectangular mask that is only a rectangle intersection, so every
+    /// pixel of the outline — including the corner arcs, which no strip is
+    /// aligned with — must still be inside some piece.
+    #[test]
+    fn a_rectangular_mask_splits_an_outline_into_pieces_that_still_cover_its_corners() {
+        let quad = outline_under(window_sized_mask(Corners::default()));
+        let pieces = Window::border_only_pieces(quad);
+
+        assert_eq!(
+            pieces.len(),
+            4,
+            "an outline with an empty interior splits into four strips"
+        );
+        let corners = [
+            quad.bounds.origin,
+            point(quad.bounds.right(), quad.bounds.top()),
+            point(quad.bounds.left(), quad.bounds.bottom()),
+            quad.bounds.bottom_right(),
+        ];
+        for corner in corners {
+            // A corner arc reaches this far in from the corner on both axes.
+            let inset = ScaledPixels(4.0);
+            let toward_center = point(
+                if corner.x == quad.bounds.left() {
+                    corner.x + inset
+                } else {
+                    corner.x - inset
+                },
+                if corner.y == quad.bounds.top() {
+                    corner.y + inset
+                } else {
+                    corner.y - inset
+                },
+            );
+            assert!(
+                pieces
+                    .iter()
+                    .any(|piece| piece.content_mask.bounds.contains(&toward_center)),
+                "no piece carries the arc at {toward_center:?}",
+            );
+        }
+    }
+
+    /// WHY: a rounded mask is a shape, not a rectangle. Narrowing its bounds to
+    /// a strip rounds that strip's own corners, which clips the ends off every
+    /// edge and erases the arcs between them. The observed defect was an
+    /// attachment card inside a rounded, clipped composer drawing as two rules
+    /// and two stubs.
+    #[test]
+    fn a_rounded_mask_leaves_an_outline_whole() {
+        let mask = window_sized_mask(Corners::all(ScaledPixels(18.0)));
+        let quad = outline_under(mask);
+        let pieces = Window::border_only_pieces(quad);
+
+        assert_eq!(
+            pieces.len(),
+            1,
+            "a rounded mask must not be narrowed to a strip"
+        );
+        assert_eq!(
+            pieces[0].content_mask, mask,
+            "the piece keeps the mask it was painted under"
+        );
+        assert_eq!(
+            pieces[0].bounds, quad.bounds,
+            "the piece keeps the whole outline"
+        );
+    }
 
     struct EmptyView;
 
