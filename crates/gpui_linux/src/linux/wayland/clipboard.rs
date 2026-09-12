@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod file_list_tests;
+
 use std::{
     fs::File,
     io::{ErrorKind, Write},
@@ -12,6 +15,7 @@ use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection
 
 use crate::linux::{
     WaylandClientStatePtr,
+    clipboard_file_list::{FILE_LIST_MIME_TYPE, read_file_list},
     platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout},
 };
 use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
@@ -19,7 +23,6 @@ use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 /// Text mime types that we'll offer to other programs.
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
-pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
 
 /// Text mime types that we'll accept from other programs.
 pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
@@ -96,6 +99,20 @@ impl<T: ReceiveData> DataOffer<T> {
                 None
             }
         }
+    }
+
+    fn read_item(&self, connection: &Connection) -> Option<ClipboardItem> {
+        if self.has_mime_type(FILE_LIST_MIME_TYPE) {
+            let bytes = self.read_bytes(connection, FILE_LIST_MIME_TYPE)?;
+            return match read_file_list(&bytes) {
+                Ok(item) => Some(item),
+                Err(error) => {
+                    log::error!("Cannot read clipboard file list: {error}");
+                    None
+                }
+            };
+        }
+        self.read_text(connection).or_else(|| self.read_image(connection))
     }
 
     fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
@@ -206,9 +223,7 @@ impl Clipboard {
             return self.contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        let item = offer.read_item(&self.connection)?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -224,9 +239,7 @@ impl Clipboard {
             return self.primary_contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        let item = offer.read_item(&self.connection)?;
 
         self.cached_primary_read = Some(item.clone());
         Some(item)

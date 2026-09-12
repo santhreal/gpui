@@ -1,3 +1,5 @@
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod clipboard_file_list;
 mod dispatcher;
 mod headless;
 mod keyboard;

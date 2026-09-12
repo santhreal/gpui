@@ -47,6 +47,10 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
+#[cfg(test)]
+mod file_list_tests;
+
+use crate::linux::clipboard_file_list::{FILE_LIST_MIME_TYPE, read_file_list};
 use gpui::{ClipboardItem, Image, ImageFormat, hash};
 use strum::IntoEnumIterator;
 
@@ -78,7 +82,7 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        URI_LIST: FILE_LIST_MIME_TYPE.as_bytes(),
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -1035,8 +1039,9 @@ impl Clipboard {
 
         // image formats first, as they are more specific, and read will return the first
         // format that the contents can be converted to
-        let mut format_atoms = Vec::with_capacity(image_entries.len() + text_format_atoms.len());
+        let mut format_atoms = Vec::with_capacity(image_entries.len() + text_format_atoms.len() + 1);
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
+        format_atoms.push(self.inner.atoms.URI_LIST);
         format_atoms.extend_from_slice(text_format_atoms);
 
         let result = self.inner.read(&format_atoms, selection)?;
@@ -1056,6 +1061,13 @@ impl Clipboard {
                     bytes,
                 }));
             }
+        }
+
+        if result.format == self.inner.atoms.URI_LIST {
+            return read_file_list(&result.bytes).map_err(|error| {
+                log::error!("Cannot read clipboard file list: {error}");
+                Error::ConversionFailure
+            });
         }
 
         let text = if result.format == self.inner.atoms.STRING {
@@ -1146,6 +1158,7 @@ fn into_unknown<E: std::fmt::Display>(error: E) -> Error {
 /// See <https://specifications.freedesktop.org/clipboards-spec/clipboards-0.1.txt> for a better
 /// description of the different clipboards.
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 pub enum ClipboardKind {
     /// Typically used selection for explicit cut/copy/paste actions (ie. windows/macos like
     /// clipboard behavior)

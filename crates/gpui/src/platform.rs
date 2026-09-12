@@ -2577,6 +2577,9 @@ pub enum ClipboardEntry {
     /// An image entry
     Image(Image),
     /// A file entry
+    ///
+    /// X11 and Wayland clipboard offers with `text/uri-list` produce local file
+    /// paths. Invalid lists and remote file authorities are rejected.
     ExternalPaths(crate::ExternalPaths),
 }
 
