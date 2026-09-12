@@ -6,8 +6,8 @@
 A reusable GPU-accelerated UI framework fork derived from
 [Zed](https://github.com/zed-industries/zed).
 
-The canonical repository is the private
-[`santhreal/gpui`](https://github.com/santhreal/gpui) repository. Framework changes
+The canonical repository is
+[`santhreal/gpui`](https://github.com/santhreal/gpui). Framework changes
 are maintained here. Applications keep their own surfaces, themes, and domain
 logic in their repositories.
 
@@ -22,11 +22,11 @@ depend on the GPUI packages rather than the Zed editor application.
 
 ## Use from another Rust project
 
-Repository access and Git authentication are required. Pin a revision:
+Pin a revision:
 
 ```toml
 [dependencies]
-gpui = { git = "ssh://git@github.com/santhreal/gpui.git", rev = "d9a8bdbcc23b4c619e186a193d147bcad82b8e69" }
+gpui = { git = "https://github.com/santhreal/gpui.git", rev = "ee35ff2e13f37ed75038d6c8a88fe4e1b737832e" }
 ```
 
 Use the same revision for companion packages such as `gpui_platform` and
