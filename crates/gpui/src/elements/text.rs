@@ -1430,4 +1430,10 @@ mod tests {
             "evicted row must shape again on cache miss"
         );
     }
+
+    #[test]
+    fn test_styled_tracking() {
+        let mut d = div().tracking(px(2.5));
+        assert_eq!(d.style().text.tracking, Some(px(2.5)));
+    }
 }

@@ -469,6 +469,24 @@ impl Style {
                 }
                 (None, None) => None,
             },
+            tracking: match (self.text.tracking, target.text.tracking) {
+                (Some(t1), Some(t2)) => Some(px(t1.0 + (t2.0 - t1.0) * t)),
+                (Some(t1), None) => {
+                    if t < 0.5 {
+                        Some(t1)
+                    } else {
+                        None
+                    }
+                }
+                (None, Some(t2)) => {
+                    if t < 0.5 {
+                        None
+                    } else {
+                        Some(t2)
+                    }
+                }
+                (None, None) => None,
+            },
             ..if t < 0.5 {
                 self.text.clone()
             } else {
@@ -647,6 +665,9 @@ pub struct TextStyle {
 
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
+
+    /// The letter spacing (tracking) to use, in pixels.
+    pub tracking: Pixels,
 }
 
 impl Default for TextStyle {
@@ -668,6 +689,7 @@ impl Default for TextStyle {
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,
+            tracking: px(0.),
         }
     }
 }
@@ -703,6 +725,10 @@ impl TextStyle {
             self.strikethrough = Some(strikethrough);
         }
 
+
+        if let Some(tracking) = style.tracking {
+            self.tracking = tracking;
+        }
         self
     }
 
@@ -737,6 +763,7 @@ impl TextStyle {
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
+            tracking: self.tracking,
         }
     }
 }
@@ -765,6 +792,9 @@ pub struct HighlightStyle {
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
+
+    /// The letter spacing (tracking) of the text, in pixels.
+    pub tracking: Option<Pixels>,
 }
 
 impl Eq for HighlightStyle {}
@@ -780,9 +810,9 @@ impl Hash for HighlightStyle {
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
         ));
+        self.tracking.hash(state);
     }
 }
-
 impl Style {
     /// Returns true if the style is visible and the background is opaque.
     pub fn has_opaque_background(&self) -> bool {
@@ -1209,6 +1239,7 @@ impl From<&TextStyle> for HighlightStyle {
             underline: other.underline,
             strikethrough: other.strikethrough,
             fade_out: None,
+            tracking: Some(other.tracking),
         }
     }
 }
@@ -1249,6 +1280,7 @@ impl HighlightStyle {
                         .unwrap_or(source_fade)
                 })
                 .or(self.fade_out),
+            tracking: other.tracking.or(self.tracking),
         }
     }
 }
@@ -1660,13 +1692,14 @@ mod tests {
             font_style: Some(FontStyle::Italic),
             font_weight: Some(FontWeight(300.)),
             background_color: Some(yellow()),
-            underline: Some(UnderlineStyle {
-                thickness: px(2.),
-                color: Some(red()),
-                wavy: true,
-            }),
-        };
-        let expected_style = style_b;
+                underline: Some(UnderlineStyle {
+                    thickness: px(2.),
+                    color: Some(red()),
+                    wavy: true,
+                }),
+                ..Default::default()
+            };
+            let expected_style = style_b;
 
         let style_a = style_a.highlight(style_b);
         assert_eq!(
@@ -1692,13 +1725,13 @@ mod tests {
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),
-            underline: Some(UnderlineStyle {
-                thickness: px(4.),
-                color: None,
-                wavy: false,
-            }),
-        };
-
+                underline: Some(UnderlineStyle {
+                    thickness: px(4.),
+                    color: None,
+                    wavy: false,
+                }),
+                ..Default::default()
+            };
         let expected_style = HighlightStyle {
             color: Some(red().blend(blue().alpha(0.7))),
             strikethrough: Some(StrikethroughStyle {
@@ -1715,6 +1748,7 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            ..Default::default()
         };
 
         let style_c = style_c.highlight(style_d);

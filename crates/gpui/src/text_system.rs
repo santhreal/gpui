@@ -58,7 +58,7 @@ pub struct TextSystem {
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
-    font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
+    layout_runs_pool: Mutex<Vec<Vec<LayoutRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
     advance_cache: Mutex<LruCache<AdvanceCacheKey, Arc<LineLayout>>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -74,7 +74,7 @@ impl TextSystem {
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
-            font_runs_pool: Mutex::default(),
+            layout_runs_pool: Mutex::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -636,14 +636,14 @@ impl WindowTextSystem {
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        let mut layout_runs = self.layout_runs_pool.lock().pop().unwrap_or_default();
 
         let mut lines = SmallVec::new();
         let mut max_wrap_lines = line_clamp;
         let mut wrapped_lines = 0;
 
         let mut process_line = |line_text: SharedString, line_start, line_end| {
-            font_runs.clear();
+            layout_runs.clear();
 
             let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(32);
             let mut run_start = line_start;
@@ -675,15 +675,17 @@ impl WindowTextSystem {
                 };
 
                 let font_id = self.resolve_font(&run.font);
-                if let Some(font_run) = font_runs.last_mut()
-                    && font_id == font_run.font_id
+                if let Some(layout_run) = layout_runs.last_mut()
+                    && font_id == layout_run.font_id
+                    && layout_run.tracking == run.tracking
                     && !decoration_changed
                 {
-                    font_run.len += run_len_within_line;
+                    layout_run.len += run_len_within_line;
                 } else {
-                    font_runs.push(FontRun {
+                    layout_runs.push(LayoutRun {
                         len: run_len_within_line,
                         font_id,
+                        tracking: run.tracking,
                     });
                 }
 
@@ -698,7 +700,7 @@ impl WindowTextSystem {
             let layout = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
-                &font_runs,
+                &layout_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
             );
@@ -750,7 +752,7 @@ impl WindowTextSystem {
             process_line(text, 0, end);
         }
 
-        self.font_runs_pool.lock().push(font_runs);
+        self.layout_runs_pool.lock().push(layout_runs);
 
         Ok(lines)
     }
@@ -770,47 +772,19 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
+        let mut layout_runs = self.layout_runs_pool.lock().pop().unwrap_or_default();
+        layout_runs.clear();
 
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        self.build_layout_runs(runs, &mut layout_runs);
 
         let layout = self.line_layout_cache.layout_line(
             &SharedString::new(text),
             font_size,
-            &font_runs,
+            &layout_runs,
             force_width,
         );
 
-        self.font_runs_pool.lock().push(font_runs);
-
+        self.layout_runs_pool.lock().push(layout_runs);
         layout
     }
 
@@ -822,9 +796,10 @@ impl WindowTextSystem {
             .layout_line(
                 buffer,
                 font_size,
-                &[FontRun {
+                &[LayoutRun {
                     len: buffer.len(),
                     font_id,
+                    tracking: px(0.),
                 }],
                 None,
             )
@@ -852,47 +827,20 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Option<Arc<LineLayout>> {
-        let mut last_run = None::<&TextRun>;
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
+        let mut layout_runs = self.layout_runs_pool.lock().pop().unwrap_or_default();
+        layout_runs.clear();
 
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        self.build_layout_runs(runs, &mut layout_runs);
 
         let layout = self.line_layout_cache.try_layout_line_by_hash(
             text_hash,
             text_len,
             font_size,
-            &font_runs,
+            &layout_runs,
             force_width,
         );
 
-        self.font_runs_pool.lock().push(font_runs);
+        self.layout_runs_pool.lock().push(layout_runs);
 
         layout
     }
@@ -914,17 +862,33 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
+        let mut layout_runs = self.layout_runs_pool.lock().pop().unwrap_or_default();
+        layout_runs.clear();
 
+        self.build_layout_runs(runs, &mut layout_runs);
+
+        let layout = self.line_layout_cache.layout_line_by_hash(
+            text_hash,
+            text_len,
+            font_size,
+            &layout_runs,
+            force_width,
+            materialize_text,
+        );
+
+        self.layout_runs_pool.lock().push(layout_runs);
+
+        layout
+    }
+
+    fn build_layout_runs(&self, runs: &[TextRun], layout_runs: &mut Vec<LayoutRun>) {
+        let mut last_run = None::<&TextRun>;
         for run in runs.iter() {
             let decoration_changed = if let Some(last_run) = last_run
                 && last_run.color == run.color
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
+                && last_run.tracking == run.tracking
             {
                 false
             } else {
@@ -933,31 +897,20 @@ impl WindowTextSystem {
             };
 
             let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
+            if let Some(layout_run) = layout_runs.last_mut()
+                && font_id == layout_run.font_id
+                && layout_run.tracking == run.tracking
                 && !decoration_changed
             {
-                font_run.len += run.len;
+                layout_run.len += run.len;
             } else {
-                font_runs.push(FontRun {
+                layout_runs.push(LayoutRun {
                     len: run.len,
                     font_id,
+                    tracking: run.tracking,
                 });
             }
         }
-
-        let layout = self.line_layout_cache.layout_line_by_hash(
-            text_hash,
-            text_len,
-            font_size,
-            &font_runs,
-            force_width,
-            materialize_text,
-        );
-
-        self.font_runs_pool.lock().push(font_runs);
-
-        layout
     }
 }
 
@@ -1118,6 +1071,8 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// The tracking (letter spacing)
+    pub tracking: Pixels,
 }
 
 #[cfg(all(target_os = "macos", test))]

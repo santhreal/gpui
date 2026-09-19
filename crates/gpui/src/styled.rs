@@ -744,6 +744,14 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the letter spacing (tracking) of this element and its children.
+    ///
+    /// This value cascades to its child elements.
+    fn tracking(mut self, tracking: impl Into<Pixels>) -> Self {
+        self.text_style().tracking = Some(tracking.into());
+        self
+    }
+
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);
