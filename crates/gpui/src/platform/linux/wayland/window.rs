@@ -157,12 +157,20 @@ impl WaylandWindowState {
             BladeRenderer::new(gpu_context, &raw_window, config)?
         };
 
+        // Set app_id on the toplevel before the caller's first
+        // surface.commit(): KWin applies window rules from the first
+        // commit's app_id and does not re-check when it changes, so a
+        // None here leaves the window unidentifiable to the compositor.
+        if let Some(app_id) = options.app_id.as_ref() {
+            toplevel.set_app_id(app_id.clone());
+        }
+
         Ok(Self {
             xdg_surface,
             acknowledged_first_configure: false,
             surface,
             decoration,
-            app_id: None,
+            app_id: options.app_id.clone(),
             blur: None,
             toplevel,
             viewport,

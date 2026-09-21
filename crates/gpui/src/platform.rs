@@ -1178,6 +1178,9 @@ pub(crate) struct WindowParams {
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub display_id: Option<DisplayId>,
 
+    #[cfg_attr(feature = "wayland", allow(dead_code))]
+    pub app_id: Option<String>,
+
     pub window_min_size: Option<Size<Pixels>>,
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
