@@ -110,6 +110,10 @@ pub struct WaylandWindowState {
     active: bool,
     hovered: bool,
     in_progress_configure: Option<InProgressConfigure>,
+    /// Interactive resizes apply once per frame: an `xdg_surface.configure`
+    /// that arrives after one was applied this frame waits here with its
+    /// serial, and the frame callback applies and acks the latest.
+    throttled_configure: Option<(InProgressConfigure, u32)>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
@@ -188,6 +192,7 @@ impl WaylandWindowState {
             tiling: Tiling::default(),
             window_bounds: options.bounds,
             in_progress_configure: None,
+            throttled_configure: None,
             resize_throttle: false,
             client,
             appearance,
@@ -365,7 +370,14 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
         state.surface.frame(&state.globals.qh, state.surface.id());
         state.resize_throttle = false;
+        let throttled = state.throttled_configure.take();
         drop(state);
+
+        // Before the frame renders: the frame then draws the latest size
+        // and its commit carries the configure's ack.
+        if let Some((configure, serial)) = throttled {
+            self.apply_configure(Some(configure), serial);
+        }
 
         let mut cb = self.callbacks.borrow_mut();
         if let Some(fun) = cb.request_frame.as_mut() {
@@ -387,63 +399,86 @@ impl WaylandWindowStatePtr {
                     }
                 }
             }
-            {
-                let mut state = self.state.borrow_mut();
-
-                if let Some(mut configure) = state.in_progress_configure.take() {
-                    let got_unmaximized = state.maximized && !configure.maximized;
-                    state.fullscreen = configure.fullscreen;
-                    state.maximized = configure.maximized;
-                    state.tiling = configure.tiling;
-                    // Limit interactive resizes to once per vblank
-                    if configure.resizing && state.resize_throttle {
-                        return;
-                    } else if configure.resizing {
-                        state.resize_throttle = true;
-                    }
-                    if !configure.fullscreen && !configure.maximized {
-                        configure.size = if got_unmaximized {
-                            Some(state.window_bounds.size)
-                        } else {
-                            compute_outer_size(state.inset(), configure.size, state.tiling)
-                        };
-                        if let Some(size) = configure.size {
-                            state.window_bounds = Bounds {
-                                origin: Point::default(),
-                                size,
-                            };
-                        }
-                    }
+            let mut state = self.state.borrow_mut();
+            // The latest toplevel state: this configure's, or else a
+            // throttled one's, which acking this newer serial acks too.
+            let configure = state
+                .in_progress_configure
+                .take()
+                .or_else(|| state.throttled_configure.take().map(|(c, _)| c));
+            // Limit interactive resizes to once per vblank. A configure
+            // dropped here would leave the window at an older size than
+            // the compositor set, and the compositor takes the size the
+            // window commits: the resize would end short of the pointer.
+            match configure {
+                Some(configure) if configure.resizing && state.resize_throttle => {
+                    state.throttled_configure = Some((configure, serial));
+                }
+                configure => {
+                    // Newer than a throttled configure, which must not be
+                    // acked after it: acking an older serial than the last
+                    // acked one is a protocol error.
+                    state.throttled_configure = None;
                     drop(state);
-                    if let Some(size) = configure.size {
-                        self.resize(size);
-                    }
+                    self.apply_configure(configure, serial);
                 }
             }
+        }
+    }
+
+    /// Apply the toplevel state of the configure with `serial`, if any
+    /// came with it, and ack it.
+    fn apply_configure(&self, configure: Option<InProgressConfigure>, serial: u32) {
+        if let Some(mut configure) = configure {
             let mut state = self.state.borrow_mut();
-            state.xdg_surface.ack_configure(serial);
-
-            let window_geometry = inset_by_tiling(
-                state.bounds.map_origin(|_| px(0.0)),
-                state.inset(),
-                state.tiling,
-            )
-            .map(|v| v.0 as i32)
-            .map_size(|v| if v <= 0 { 1 } else { v });
-
-            state.xdg_surface.set_window_geometry(
-                window_geometry.origin.x,
-                window_geometry.origin.y,
-                window_geometry.size.width,
-                window_geometry.size.height,
-            );
-
-            let request_frame_callback = !state.acknowledged_first_configure;
-            if request_frame_callback {
-                state.acknowledged_first_configure = true;
-                drop(state);
-                self.frame();
+            let got_unmaximized = state.maximized && !configure.maximized;
+            state.fullscreen = configure.fullscreen;
+            state.maximized = configure.maximized;
+            state.tiling = configure.tiling;
+            if configure.resizing {
+                state.resize_throttle = true;
             }
+            if !configure.fullscreen && !configure.maximized {
+                configure.size = if got_unmaximized {
+                    Some(state.window_bounds.size)
+                } else {
+                    compute_outer_size(state.inset(), configure.size, state.tiling)
+                };
+                if let Some(size) = configure.size {
+                    state.window_bounds = Bounds {
+                        origin: Point::default(),
+                        size,
+                    };
+                }
+            }
+            drop(state);
+            if let Some(size) = configure.size {
+                self.resize(size);
+            }
+        }
+        let mut state = self.state.borrow_mut();
+        state.xdg_surface.ack_configure(serial);
+
+        let window_geometry = inset_by_tiling(
+            state.bounds.map_origin(|_| px(0.0)),
+            state.inset(),
+            state.tiling,
+        )
+        .map(|v| v.0 as i32)
+        .map_size(|v| if v <= 0 { 1 } else { v });
+
+        state.xdg_surface.set_window_geometry(
+            window_geometry.origin.x,
+            window_geometry.origin.y,
+            window_geometry.size.width,
+            window_geometry.size.height,
+        );
+
+        let request_frame_callback = !state.acknowledged_first_configure;
+        if request_frame_callback {
+            state.acknowledged_first_configure = true;
+            drop(state);
+            self.frame();
         }
     }
 
