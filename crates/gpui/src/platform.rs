@@ -1203,6 +1203,16 @@ pub(crate) struct WindowParams {
     pub app_id: Option<String>,
 
     pub window_min_size: Option<Size<Pixels>>,
+
+    /// The background the window opens with. A platform that sizes its
+    /// renderer or its native surface to transparency creates them for
+    /// this background, instead of rebuilding them when
+    /// `set_background_appearance` follows the open.
+    #[cfg_attr(
+        not(all(any(target_os = "linux", target_os = "freebsd"), feature = "x11")),
+        allow(dead_code)
+    )]
+    pub window_background: WindowBackgroundAppearance,
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
 }

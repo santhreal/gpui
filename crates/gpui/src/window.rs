@@ -1004,6 +1004,7 @@ impl Window {
                 display_id,
                 app_id: app_id.clone(),
                 window_min_size,
+                window_background,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
             },
@@ -5155,5 +5156,77 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TestAppContext;
+
+    fn counting_waker() -> (Rc<Cell<usize>>, Rc<dyn Fn()>) {
+        let wakes = Rc::new(Cell::new(0));
+        let waker = Rc::new({
+            let wakes = wakes.clone();
+            move || wakes.set(wakes.get() + 1)
+        });
+        (wakes, waker)
+    }
+
+    /// A platform that parks an idle window draws it again only after a
+    /// wake. Every transition into frame demand must wake the platform,
+    /// or the window keeps showing a stale frame until unrelated input
+    /// arrives; demand that is already pending must not wake it again.
+    /// Demand from outside GPUI, such as an expose event, belongs to the
+    /// platform and is not covered here.
+    #[crate::test]
+    fn demand_transitions_wake_a_parked_platform(cx: &mut TestAppContext) {
+        let invalidator = WindowInvalidator::new();
+        let (wakes, waker) = counting_waker();
+
+        // A new window is dirty: registering the waker requests its first frame.
+        invalidator.set_platform_waker(Some(waker));
+        assert_eq!(wakes.get(), 1);
+        invalidator.set_dirty(true);
+        assert_eq!(wakes.get(), 1, "a dirty window already has a frame requested");
+
+        invalidator.set_dirty(false);
+        assert_eq!(wakes.get(), 1, "a drawn window has no demand");
+        invalidator.set_dirty(true);
+        assert_eq!(wakes.get(), 2);
+
+        invalidator.set_dirty(false);
+        let view = cx.update(|cx| cx.new(|_| ()));
+        let view_id = view.entity_id();
+        assert!(cx.update(|cx| invalidator.invalidate_view(view_id, cx)));
+        assert_eq!(wakes.get(), 3);
+        assert!(cx.update(|cx| invalidator.invalidate_view(view_id, cx)));
+        assert_eq!(wakes.get(), 3, "a dirty window already has a frame requested");
+
+        // A view notified while the window draws is drawn by that frame.
+        invalidator.set_dirty(false);
+        invalidator.set_phase(DrawPhase::Paint);
+        assert!(!cx.update(|cx| invalidator.invalidate_view(view_id, cx)));
+        invalidator.set_phase(DrawPhase::None);
+        assert_eq!(wakes.get(), 3);
+
+        invalidator.wake_platform();
+        assert_eq!(wakes.get(), 4);
+    }
+
+    /// An animation asks for its next frame with a next-frame callback,
+    /// which does not dirty the window. The callback must wake the
+    /// platform itself, or a parked window stops animating after a frame.
+    #[crate::test]
+    fn next_frame_callback_wakes_a_parked_platform(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (wakes, waker) = counting_waker();
+        cx.update(|window, _| {
+            window.invalidator.set_dirty(false);
+            window.invalidator.set_platform_waker(Some(waker));
+            assert_eq!(wakes.get(), 0);
+            window.on_next_frame(|_, _| {});
+            assert_eq!(wakes.get(), 1);
+        });
     }
 }

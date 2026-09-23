@@ -17,7 +17,7 @@ use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
     errors::ConnectionError,
-    properties::{WmHints, WmSizeHints},
+    properties::{WmHints, WmSizeHints, WmSizeHintsSpecification},
     protocol::{
         sync,
         xinput::{self, ConnectionExt as _},
@@ -66,6 +66,9 @@ x11rb::atom_manager! {
         _NET_WM_STATE_FULLSCREEN,
         _NET_WM_STATE_HIDDEN,
         _NET_WM_STATE_FOCUSED,
+        _NET_WM_STATE_ABOVE,
+        _NET_WM_STATE_SKIP_TASKBAR,
+        _NET_WM_STATE_SKIP_PAGER,
         _NET_ACTIVE_WINDOW,
         _NET_WM_SYNC_REQUEST,
         _NET_WM_SYNC_REQUEST_COUNTER,
@@ -94,6 +97,30 @@ fn query_render_extent(
         height: reply.height as u32,
         depth: 1,
     })
+}
+
+/// `_MOTIF_WM_HINTS` with the decorations field alone set: the window
+/// manager's frame when `decorated`, none otherwise.
+/// https://github.com/rust-windowing/winit/blob/master/src/platform_impl/linux/x11/util/hint.rs#L53-L87
+fn set_motif_decorations(
+    xcb: &XCBConnection,
+    x_window: xproto::Window,
+    atoms: &XcbAtoms,
+    decorated: bool,
+) -> anyhow::Result<()> {
+    let hints: [u32; 5] = [1 << 1, 0, decorated as u32, 0, 0];
+    check_reply(
+        || "X11 ChangeProperty for _MOTIF_WM_HINTS failed.",
+        xcb.change_property(
+            xproto::PropMode::REPLACE,
+            x_window,
+            atoms._MOTIF_WM_HINTS,
+            atoms._MOTIF_WM_HINTS,
+            32,
+            5,
+            bytemuck::cast_slice::<u32, u8>(&hints),
+        ),
+    )
 }
 
 impl ResizeEdge {
@@ -270,6 +297,8 @@ pub struct X11WindowState {
     fullscreen: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
+    /// A `WindowKind::PopUp`: never framed by the window manager.
+    popup: bool,
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
@@ -317,12 +346,31 @@ impl rwh::HasDisplayHandle for RawWindow {
 
 impl rwh::HasWindowHandle for X11Window {
     fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
-        unimplemented!()
+        let window = NonZeroU32::new(self.0.x_window).ok_or(rwh::HandleError::Unavailable)?;
+        let handle = rwh::XcbWindowHandle::new(window);
+        // SAFETY: the X window is destroyed only when this X11Window
+        // drops, which the returned borrow cannot outlive.
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(handle.into()) })
     }
 }
 impl rwh::HasDisplayHandle for X11Window {
     fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        unimplemented!()
+        let connection =
+            as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(&*self.0.xcb);
+        let connection = NonNull::new(connection.cast::<c_void>())
+            .ok_or(rwh::HandleError::Unavailable)?;
+        let screen = self
+            .0
+            .state
+            .try_borrow()
+            .map_err(|_| rwh::HandleError::Unavailable)?
+            .display
+            .id()
+            .0 as i32;
+        let handle = rwh::XcbDisplayHandle::new(Some(connection), screen);
+        // SAFETY: the connection is the client's, which outlives every
+        // window it opened.
+        Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
     }
 }
 
@@ -393,6 +441,7 @@ impl X11WindowState {
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
+        compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
         atoms: &XcbAtoms,
@@ -427,7 +476,8 @@ impl X11WindowState {
             id
         };
 
-        let win_aux = xproto::CreateWindowAux::new()
+        let transparent = params.window_background != WindowBackgroundAppearance::Opaque;
+        let mut win_aux = xproto::CreateWindowAux::new()
             // https://stackoverflow.com/questions/43218127/x11-xlib-xcb-creating-a-window-requires-border-pixel-if-specifying-colormap-wh
             .border_pixel(visual_set.black_pixel)
             .colormap(colormap)
@@ -440,6 +490,16 @@ impl X11WindowState {
                     | xproto::EventMask::PROPERTY_CHANGE
                     | xproto::EventMask::VISIBILITY_CHANGE,
             );
+        if transparent && compositor_present && visual_set.transparent.is_some() {
+            // A mapped window shows its background until its first frame
+            // is presented. With none, a compositor draws the new backing
+            // pixmap as the server filled it, black on most servers, over
+            // whatever is below; an ARGB pixel of 0 is fully transparent
+            // there, so nothing shows until the frame lands. Without a
+            // compositor the server draws that pixel as black, and no
+            // background at all leaves the screen as it was instead.
+            win_aux = win_aux.background_pixel(0);
+        }
 
         let mut bounds = params.bounds.to_device_pixels(scale_factor);
         if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
@@ -452,6 +512,13 @@ impl X11WindowState {
             bounds.size.height = 600.into();
         }
 
+        let popup = params.kind == WindowKind::PopUp;
+        // A pop-up opens where its owner puts it. Any other window opens
+        // 2px right of its request, as part of the workaround below for
+        // content drawn outside the bounds at a window manager's default
+        // position.
+        let create_x = bounds.origin.x.0 + if popup { 0 } else { 2 };
+
         check_reply(
             || {
                 format!(
@@ -459,7 +526,7 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    bounds.origin.x.0 + 2,
+                    create_x,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
@@ -469,7 +536,7 @@ impl X11WindowState {
                 visual.depth,
                 x_window,
                 visual_set.root,
-                (bounds.origin.x.0 + 2) as i16,
+                create_x as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -494,14 +561,26 @@ impl X11WindowState {
                 ),
             )?;
 
-            if let Some(size) = params.window_min_size {
-                let mut size_hints = WmSizeHints::new();
+            let min_size = params.window_min_size.map(|size| {
                 // WM_NORMAL_HINTS are in device pixels, as the bounds above.
-                let min_size = (
+                (
                     (size.width.0 * scale_factor).round() as i32,
                     (size.height.0 * scale_factor).round() as i32,
-                );
-                size_hints.min_size = Some(min_size);
+                )
+            });
+            if min_size.is_some() || popup {
+                let mut size_hints = WmSizeHints::new();
+                size_hints.min_size = min_size;
+                if popup {
+                    // Flagged user-specified: a window manager maps the
+                    // pop-up where its owner put it instead of applying its
+                    // own placement, which only a later move would undo.
+                    size_hints.position = Some((
+                        WmSizeHintsSpecification::UserSpecified,
+                        bounds.origin.x.0,
+                        bounds.origin.y.0,
+                    ));
+                }
                 check_reply(
                     || {
                         format!(
@@ -513,18 +592,23 @@ impl X11WindowState {
                 )?;
             }
 
-            let reply = get_reply(|| "X11 GetGeometry failed.", xcb.get_geometry(x_window))?;
-            if reply.x == 0 && reply.y == 0 {
-                bounds.origin.x.0 += 2;
-                // Work around a bug where our rendered content appears
-                // outside the window bounds when opened at the default position
-                // (14px, 49px on X + Gnome + Ubuntu 22).
-                let x = bounds.origin.x.0;
-                let y = bounds.origin.y.0;
-                check_reply(
-                    || format!("X11 ConfigureWindow failed. x: {}, y: {}", x, y),
-                    xcb.configure_window(x_window, &xproto::ConfigureWindowAux::new().x(x).y(y)),
-                )?;
+            if !popup {
+                let reply = get_reply(|| "X11 GetGeometry failed.", xcb.get_geometry(x_window))?;
+                if reply.x == 0 && reply.y == 0 {
+                    bounds.origin.x.0 += 2;
+                    // Work around a bug where our rendered content appears
+                    // outside the window bounds when opened at the default position
+                    // (14px, 49px on X + Gnome + Ubuntu 22).
+                    let x = bounds.origin.x.0;
+                    let y = bounds.origin.y.0;
+                    check_reply(
+                        || format!("X11 ConfigureWindow failed. x: {}, y: {}", x, y),
+                        xcb.configure_window(
+                            x_window,
+                            &xproto::ConfigureWindowAux::new().x(x).y(y),
+                        ),
+                    )?;
+                }
             }
             if let Some(titlebar) = params.titlebar
                 && let Some(title) = titlebar.title
@@ -541,7 +625,7 @@ impl X11WindowState {
                 )?;
             }
 
-            if params.kind == WindowKind::PopUp {
+            if popup {
                 check_reply(
                     || "X11 ChangeProperty32 setting window type for pop-up failed.",
                     xcb.change_property32(
@@ -562,6 +646,28 @@ impl X11WindowState {
                 check_reply(
                     || "X11 ChangeProperty32 setting WM_HINTS for pop-up failed.",
                     hints.set(xcb, x_window),
+                )?;
+                // No frame: a pop-up draws all of itself. Set before the
+                // map, so no window manager frames it; changed on a mapped
+                // window, most re-frame it, which discards what it drew.
+                set_motif_decorations(xcb, x_window, atoms, false)?;
+                // Above other windows and out of taskbars and pagers, as the
+                // notification type asks. A window manager reads the initial
+                // state from the window when it maps it, one that predates
+                // the notification type included.
+                check_reply(
+                    || "X11 ChangeProperty32 setting _NET_WM_STATE for pop-up failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._NET_WM_STATE,
+                        xproto::AtomEnum::ATOM,
+                        &[
+                            atoms._NET_WM_STATE_ABOVE,
+                            atoms._NET_WM_STATE_SKIP_TASKBAR,
+                            atoms._NET_WM_STATE_SKIP_PAGER,
+                        ],
+                    ),
                 )?;
             }
 
@@ -674,11 +780,11 @@ impl X11WindowState {
                     // Note: this has to be done after the GPU init, or otherwise
                     // the sizes are immediately invalidated.
                     size: query_render_extent(xcb, x_window)?,
-                    // We set it to transparent by default, even if we have client-side
-                    // decorations, since those seem to work on X11 even without `true` here.
-                    // If the window appearance changes, then the renderer will get updated
-                    // too
-                    transparent: false,
+                    // Created for the opening background: the
+                    // set_background_appearance that follows the open is
+                    // then no change, where a mismatch would rebuild the
+                    // swapchain and every pipeline.
+                    transparent,
                 };
                 BladeRenderer::new(gpu_context, &raw_window, config)?
             };
@@ -703,10 +809,11 @@ impl X11WindowState {
                 hidden: false,
                 appearance,
                 handle,
-                background_appearance: WindowBackgroundAppearance::Opaque,
+                background_appearance: params.window_background,
                 destroyed: false,
                 client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
+                popup,
                 last_insets: [0, 0, 0, 0],
                 press_root: None,
                 edge_constraints: None,
@@ -802,6 +909,7 @@ impl X11Window {
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
+        compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
         atoms: &XcbAtoms,
@@ -819,6 +927,7 @@ impl X11Window {
                 params,
                 xcb,
                 client_side_decorations_supported,
+                compositor_present,
                 x_main_screen_index,
                 x_window,
                 atoms,
@@ -1587,12 +1696,6 @@ impl PlatformWindow for X11Window {
 
     fn window_decorations(&self) -> crate::Decorations {
         let state = self.0.state.borrow();
-
-        // Client window decorations require compositor support
-        if !state.client_side_decorations_supported {
-            return Decorations::Server;
-        }
-
         match state.decorations {
             WindowDecorations::Server => Decorations::Server,
             WindowDecorations::Client => {
@@ -1664,51 +1767,29 @@ impl PlatformWindow for X11Window {
     fn request_decorations(&self, mut decorations: crate::WindowDecorations) {
         let mut state = self.0.state.borrow_mut();
 
-        if matches!(decorations, crate::WindowDecorations::Client)
-            && !state.client_side_decorations_supported
-        {
-            log::info!(
-                "x11: no compositor present, falling back to server-side window decorations"
-            );
-            decorations = crate::WindowDecorations::Server;
+        if state.popup {
+            // A pop-up has no frame to fall back to, and its frame hint is
+            // set once, before the map.
+            decorations = crate::WindowDecorations::Client;
+        } else {
+            if matches!(decorations, crate::WindowDecorations::Client)
+                && !state.client_side_decorations_supported
+            {
+                log::info!(
+                    "x11: no compositor present, falling back to server-side window decorations"
+                );
+                decorations = crate::WindowDecorations::Server;
+            }
+            let decorated = matches!(decorations, crate::WindowDecorations::Server);
+            let set = set_motif_decorations(&self.0.xcb, self.0.x_window, &state.atoms, decorated);
+            let Some(()) = set.log_err() else {
+                return;
+            };
         }
 
-        // https://github.com/rust-windowing/winit/blob/master/src/platform_impl/linux/x11/util/hint.rs#L53-L87
-        let hints_data: [u32; 5] = match decorations {
-            WindowDecorations::Server => [1 << 1, 0, 1, 0, 0],
-            WindowDecorations::Client => [1 << 1, 0, 0, 0, 0],
-        };
-
-        let success = check_reply(
-            || "X11 ChangeProperty for _MOTIF_WM_HINTS failed.",
-            self.0.xcb.change_property(
-                xproto::PropMode::REPLACE,
-                self.0.x_window,
-                state.atoms._MOTIF_WM_HINTS,
-                state.atoms._MOTIF_WM_HINTS,
-                size_of::<u32>() as u8 * 8,
-                5,
-                bytemuck::cast_slice::<u32, u8>(&hints_data),
-            ),
-        )
-        .log_err();
-
-        let Some(()) = success else {
-            return;
-        };
-
-        match decorations {
-            WindowDecorations::Server => {
-                state.decorations = WindowDecorations::Server;
-                let is_transparent = state.is_transparent();
-                state.renderer.update_transparency(is_transparent);
-            }
-            WindowDecorations::Client => {
-                state.decorations = WindowDecorations::Client;
-                let is_transparent = state.is_transparent();
-                state.renderer.update_transparency(is_transparent);
-            }
-        }
+        state.decorations = decorations;
+        let is_transparent = state.is_transparent();
+        state.renderer.update_transparency(is_transparent);
 
         drop(state);
         let mut callbacks = self.0.callbacks.borrow_mut();

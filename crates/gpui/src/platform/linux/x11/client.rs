@@ -299,6 +299,9 @@ pub struct X11ClientState {
     pub(crate) xcb_connection: Rc<XCBConnection>,
     xkb_device_id: i32,
     client_side_decorations_supported: bool,
+    /// A compositing manager ran on the screen at startup: alpha in a
+    /// window's pixels blends with what is below it.
+    compositor_present: bool,
     pub(crate) x_root_index: usize,
     pub(crate) _resource_database: Database,
     pub(crate) atoms: XcbAtoms,
@@ -459,11 +462,15 @@ impl X11Client {
             .reply()
             .context("Failed to get XCB atoms")?;
 
-        let root = xcb_connection.setup().roots[0].root;
-        let compositor_present = check_compositor_present(&xcb_connection, root);
+        let root = xcb_connection.setup().roots[x_root_index].root;
+        let compositor_present = check_compositor_present(&xcb_connection, x_root_index, root);
         let gtk_frame_extents_supported =
             check_gtk_frame_extents_supported(&xcb_connection, &atoms, root);
-        let client_side_decorations_supported = compositor_present && gtk_frame_extents_supported;
+        // A window manager that handles _GTK_FRAME_EXTENTS handles windows
+        // that draw their own frame. A compositor decides only whether
+        // their transparent pixels blend, which a frame from the window
+        // manager would not change.
+        let client_side_decorations_supported = gtk_frame_extents_supported;
         log::info!(
             "x11: compositor present: {}, gtk_frame_extents_supported: {}",
             compositor_present,
@@ -597,6 +604,7 @@ impl X11Client {
             xcb_connection,
             xkb_device_id,
             client_side_decorations_supported,
+            compositor_present,
             x_root_index,
             _resource_database: resource_database,
             atoms,
@@ -1594,6 +1602,7 @@ impl LinuxClient for X11Client {
             params,
             &state.xcb_connection,
             state.client_side_decorations_supported,
+            state.compositor_present,
             state.x_root_index,
             x_window,
             &state.atoms,
@@ -1980,73 +1989,45 @@ fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
     value.integral as f32 + value.frac as f32 / u32::MAX as f32
 }
 
-fn check_compositor_present(xcb_connection: &XCBConnection, root: u32) -> bool {
-    // Method 1: Check for _NET_WM_CM_S{root}
-    let atom_name = format!("_NET_WM_CM_S{}", root);
-    let atom1 = get_reply(
+/// Whether a compositing manager runs on screen `screen`: it owns the
+/// screen's `_NET_WM_CM_S<n>` selection (EWMH), or sets the
+/// `_NET_WM_CM_OWNER` root property some older ones set instead. A
+/// window manager alone (`_NET_SUPPORTING_WM_CHECK`) composites
+/// nothing, so it does not count.
+fn check_compositor_present(xcb_connection: &XCBConnection, screen: usize, root: u32) -> bool {
+    let atom_name = format!("_NET_WM_CM_S{screen}");
+    let selection = get_reply(
         || format!("Failed to intern {atom_name}"),
-        xcb_connection.intern_atom(false, atom_name.as_bytes()),
+        xcb_connection.intern_atom(true, atom_name.as_bytes()),
     );
-    let method1 = match atom1.log_with_level(Level::Debug) {
-        Some(reply) if reply.atom != x11rb::NONE => {
-            let atom = reply.atom;
-            get_reply(
-                || format!("Failed to get {atom_name} owner"),
-                xcb_connection.get_selection_owner(atom),
-            )
-            .map(|reply| reply.owner != 0)
-            .log_with_level(Level::Debug)
-            .unwrap_or(false)
-        }
+    let owned = match selection.log_with_level(Level::Debug) {
+        Some(reply) if reply.atom != x11rb::NONE => get_reply(
+            || format!("Failed to get {atom_name} owner"),
+            xcb_connection.get_selection_owner(reply.atom),
+        )
+        .map(|reply| reply.owner != 0)
+        .log_with_level(Level::Debug)
+        .unwrap_or(false),
         _ => false,
     };
 
-    // Method 2: Check for _NET_WM_CM_OWNER
     let atom_name = "_NET_WM_CM_OWNER";
-    let atom2 = get_reply(
+    let property = get_reply(
         || format!("Failed to intern {atom_name}"),
-        xcb_connection.intern_atom(false, atom_name.as_bytes()),
+        xcb_connection.intern_atom(true, atom_name.as_bytes()),
     );
-    let method2 = match atom2.log_with_level(Level::Debug) {
-        Some(reply) if reply.atom != x11rb::NONE => {
-            let atom = reply.atom;
-            get_reply(
-                || format!("Failed to get {atom_name}"),
-                xcb_connection.get_property(false, root, atom, xproto::AtomEnum::WINDOW, 0, 1),
-            )
-            .map(|reply| reply.value_len > 0)
-            .unwrap_or(false)
-        }
-        _ => return false,
+    let announced = match property.log_with_level(Level::Debug) {
+        Some(reply) if reply.atom != x11rb::NONE => get_reply(
+            || format!("Failed to get {atom_name}"),
+            xcb_connection.get_property(false, root, reply.atom, xproto::AtomEnum::WINDOW, 0, 1),
+        )
+        .map(|reply| reply.value_len > 0)
+        .unwrap_or(false),
+        _ => false,
     };
 
-    // Method 3: Check for _NET_SUPPORTING_WM_CHECK
-    let atom_name = "_NET_SUPPORTING_WM_CHECK";
-    let atom3 = get_reply(
-        || format!("Failed to intern {atom_name}"),
-        xcb_connection.intern_atom(false, atom_name.as_bytes()),
-    );
-    let method3 = match atom3.log_with_level(Level::Debug) {
-        Some(reply) if reply.atom != x11rb::NONE => {
-            let atom = reply.atom;
-            get_reply(
-                || format!("Failed to get {atom_name}"),
-                xcb_connection.get_property(false, root, atom, xproto::AtomEnum::WINDOW, 0, 1),
-            )
-            .map(|reply| reply.value_len > 0)
-            .unwrap_or(false)
-        }
-        _ => return false,
-    };
-
-    log::debug!(
-        "Compositor detection: _NET_WM_CM_S?={}, _NET_WM_CM_OWNER={}, _NET_SUPPORTING_WM_CHECK={}",
-        method1,
-        method2,
-        method3
-    );
-
-    method1 || method2 || method3
+    log::debug!("Compositor detection: _NET_WM_CM_S{screen}={owned}, {atom_name}={announced}");
+    owned || announced
 }
 
 fn check_gtk_frame_extents_supported(

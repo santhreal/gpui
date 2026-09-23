@@ -583,6 +583,7 @@ impl MacWindow {
             window_min_size,
             tabbing_identifier,
             app_id: _,
+            window_background: _,
         }: WindowParams,
         executor: ForegroundExecutor,
         renderer_context: renderer::Context,
