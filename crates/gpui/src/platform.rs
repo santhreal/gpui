@@ -167,6 +167,9 @@ pub(crate) trait Platform: 'static {
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
     fn quit(&self);
+    /// Whether the run loop stops when the last window closes. Linux and
+    /// Windows stop by default; macOS never stops on its own.
+    fn set_quit_on_last_window_closed(&self, _quit: bool) {}
     fn restart(&self, binary_path: Option<PathBuf>);
     fn activate(&self, ignoring_other_apps: bool);
     fn hide(&self);

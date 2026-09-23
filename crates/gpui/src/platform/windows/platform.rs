@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::OsStr,
     mem::ManuallyDrop,
     path::{Path, PathBuf},
@@ -48,6 +48,8 @@ struct WindowsPlatformInner {
     // The below members will never change throughout the entire lifecycle of the app.
     validation_number: usize,
     main_receiver: flume::Receiver<Runnable>,
+    /// Post WM_QUIT when the last window closes (the default).
+    quit_on_last_window_closed: Cell<bool>,
 }
 
 pub(crate) struct WindowsPlatformState {
@@ -325,6 +327,10 @@ impl Platform for WindowsPlatform {
         self.foreground_executor()
             .spawn(async { unsafe { PostQuitMessage(0) } })
             .detach();
+    }
+
+    fn set_quit_on_last_window_closed(&self, quit: bool) {
+        self.inner.quit_on_last_window_closed.set(quit);
     }
 
     fn restart(&self, binary_path: Option<PathBuf>) {
@@ -684,6 +690,7 @@ impl WindowsPlatformInner {
             raw_window_handles: context.raw_window_handles.clone(),
             validation_number: context.validation_number,
             main_receiver: context.main_receiver.take().unwrap(),
+            quit_on_last_window_closed: Cell::new(true),
         }))
     }
 
@@ -716,7 +723,9 @@ impl WindowsPlatformInner {
         }
         match message {
             WM_GPUI_CLOSE_ONE_WINDOW => {
-                if self.close_one_window(HWND(lparam.0 as _)) {
+                if self.close_one_window(HWND(lparam.0 as _))
+                    && self.quit_on_last_window_closed.get()
+                {
                     unsafe { PostQuitMessage(0) };
                 }
                 Some(0)

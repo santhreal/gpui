@@ -750,6 +750,13 @@ impl App {
         self.platform.quit();
     }
 
+    /// With `false`, closing the last window leaves the app running; it
+    /// then exits only through [`App::quit`]. Linux and Windows stop the
+    /// run loop on the last window close by default; macOS never does.
+    pub fn set_quit_on_last_window_closed(&self, quit: bool) {
+        self.platform.set_quit_on_last_window_closed(quit);
+    }
+
     /// Schedules all windows in the application to be redrawn. This can be called
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {

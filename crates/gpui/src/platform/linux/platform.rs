@@ -101,6 +101,8 @@ pub(crate) struct LinuxCommon {
     pub(crate) auto_hide_scrollbars: bool,
     pub(crate) callbacks: PlatformHandlers,
     pub(crate) signal: LoopSignal,
+    /// Stop `signal` when the last window drops (the default).
+    pub(crate) quit_on_last_window_closed: bool,
     pub(crate) menus: Vec<OwnedMenu>,
 }
 
@@ -127,6 +129,7 @@ impl LinuxCommon {
             auto_hide_scrollbars: false,
             callbacks,
             signal,
+            quit_on_last_window_closed: true,
             menus: Vec::new(),
         };
 
@@ -172,6 +175,10 @@ impl<P: LinuxClient + 'static> Platform for P {
 
     fn quit(&self) {
         self.with_common(|common| common.signal.stop());
+    }
+
+    fn set_quit_on_last_window_closed(&self, quit: bool) {
+        self.with_common(|common| common.quit_on_last_window_closed = quit);
     }
 
     fn compositor_name(&self) -> &'static str {
