@@ -600,7 +600,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
-        KeyBinding, Keystroke, ParentElement, Render, TestAppContext, Window, div,
+        KeyBinding, Keystroke, Modifiers, MouseExitEvent, ParentElement, Render,
+        StatefulInteractiveElement, Styled, TestAppContext, Window, div, point, px,
     };
 
     struct TestView {
@@ -666,5 +667,47 @@ mod test {
                 assert!(test_view.saw_action);
             })
             .unwrap();
+    }
+
+    struct HoverView {
+        hovers: Vec<bool>,
+    }
+
+    impl Render for HoverView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("target")
+                    .absolute()
+                    .left(px(20.))
+                    .top(px(20.))
+                    .size(px(40.))
+                    .on_hover(cx.listener(|this: &mut HoverView, hovered: &bool, _, _| {
+                        this.hovers.push(*hovered)
+                    })),
+            )
+        }
+    }
+
+    // The pointer can jump from an element straight out of the window. The
+    // platform then reports only the exit, from the last position inside the
+    // element, and no move outside it: the exit alone ends the hover.
+    #[gpui::test]
+    fn test_hover_ends_when_the_pointer_leaves_the_window(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| HoverView { hovers: Vec::new() });
+        let inside = point(px(30.), px(30.));
+        cx.simulate_mouse_move(inside, None, Modifiers::none());
+        view.read_with(cx, |view, _| assert_eq!(view.hovers, [true]));
+
+        cx.simulate_event(MouseExitEvent {
+            position: inside,
+            pressed_button: None,
+            modifiers: Modifiers::none(),
+        });
+        view.read_with(cx, |view, _| assert_eq!(view.hovers, [true, false]));
+
+        // Back in: hover resumes from the exit, not from a stale state.
+        cx.simulate_mouse_move(inside, None, Modifiers::none());
+        view.read_with(cx, |view, _| assert_eq!(view.hovers, [true, false, true]));
     }
 }

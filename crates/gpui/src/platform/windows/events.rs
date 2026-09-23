@@ -55,7 +55,7 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
-            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
+            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(handle),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
             // If you don't interact with any elements, this will fall through to the windows default
@@ -315,7 +315,30 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn handle_mouse_leave_msg(&self) -> Option<isize> {
+    fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
+        // The pointer can leave with no final WM_MOUSEMOVE outside the element it
+        // was over, so report the exit, as the other platforms do, for hover state
+        // to clear. Crossing into this window's own frame is no exit: the
+        // WM_NCMOUSEMOVE that follows keeps the window hovered.
+        let mut screen = POINT::default();
+        let exited = unsafe { GetCursorPos(&mut screen) }.is_ok()
+            && unsafe { WindowFromPoint(screen) } != handle;
+        if exited {
+            let mut lock = self.state.borrow_mut();
+            let scale_factor = lock.scale_factor;
+            if let Some(mut func) = lock.callbacks.input.take() {
+                drop(lock);
+                let mut client = screen;
+                unsafe { ScreenToClient(handle, &mut client).ok().log_err() };
+                func(PlatformInput::MouseExited(MouseExitEvent {
+                    position: logical_point(client.x as f32, client.y as f32, scale_factor),
+                    pressed_button: None,
+                    modifiers: current_modifiers(),
+                }));
+                self.state.borrow_mut().callbacks.input = Some(func);
+            }
+        }
+
         let mut lock = self.state.borrow_mut();
         lock.hovered = false;
         if let Some(mut callback) = lock.callbacks.hovered_status_change.take() {
