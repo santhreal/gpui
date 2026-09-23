@@ -273,6 +273,9 @@ pub struct X11WindowState {
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
+    /// Root position of the button press the pointer is held from, the
+    /// anchor a window manager measures a _NET_WM_MOVERESIZE drag from.
+    press_root: Option<(i32, i32)>,
 }
 
 impl X11WindowState {
@@ -693,6 +696,7 @@ impl X11WindowState {
                 client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
+                press_root: None,
                 edge_constraints: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
@@ -868,17 +872,27 @@ impl X11Window {
             self.0.xcb.ungrab_pointer(x11rb::CURRENT_TIME),
         )?;
 
-        let pointer = get_reply(
-            || "X11 QueryPointer before move/resize of window failed.",
-            self.0.xcb.query_pointer(self.0.x_window),
-        )?;
+        // The window manager moves the window by the pointer's travel from
+        // this point. The press anchors the drag where it began: the
+        // pointer may have moved on before the press was handled, and the
+        // window would trail it by that distance.
+        let (root_x, root_y) = match state.press_root {
+            Some(at) => at,
+            None => {
+                let pointer = get_reply(
+                    || "X11 QueryPointer before move/resize of window failed.",
+                    self.0.xcb.query_pointer(self.0.x_window),
+                )?;
+                (pointer.root_x.into(), pointer.root_y.into())
+            }
+        };
         let message = ClientMessageEvent::new(
             32,
             self.0.x_window,
             state.atoms._NET_WM_MOVERESIZE,
             [
-                pointer.root_x as u32,
-                pointer.root_y as u32,
+                root_x as u32,
+                root_y as u32,
                 flag,
                 0, // Left mouse button
                 0,
@@ -1145,6 +1159,11 @@ impl X11WindowStatePtr {
         if let Some(ref mut fun) = self.callbacks.borrow_mut().hovered_status_change {
             fun(focus);
         }
+    }
+
+    /// Record the root position of a button press, `None` once released.
+    pub fn set_press_root(&self, at: Option<(i32, i32)>) {
+        self.state.borrow_mut().press_root = at;
     }
 
     pub fn set_appearance(&mut self, appearance: WindowAppearance) {

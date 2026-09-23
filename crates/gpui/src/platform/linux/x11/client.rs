@@ -1118,6 +1118,8 @@ impl X11Client {
                         let current_count = state.current_count;
 
                         drop(state);
+                        // XI2 root coordinates are 16.16 fixed point.
+                        window.set_press_root(Some((event.root_x >> 16, event.root_y >> 16)));
                         window.handle_input(PlatformInput::MouseDown(crate::MouseDownEvent {
                             button,
                             position,
@@ -1164,6 +1166,7 @@ impl X11Client {
                     Some(ButtonOrScroll::Button(button)) => {
                         let click_count = state.current_count;
                         drop(state);
+                        window.set_press_root(None);
                         window.handle_input(PlatformInput::MouseUp(crate::MouseUpEvent {
                             button,
                             position,
