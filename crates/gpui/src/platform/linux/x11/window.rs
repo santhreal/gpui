@@ -720,6 +720,17 @@ pub(crate) struct X11Window(pub X11WindowStatePtr);
 impl Drop for X11Window {
     fn drop(&mut self) {
         let mut state = self.0.state.borrow_mut();
+        // Unmap before the renderer goes. Tearing down the swapchain of
+        // a mapped window leaves the window's storage black, and a
+        // compositor paints that for a frame before the DestroyWindow
+        // below takes the window off screen. The checked request is a
+        // round trip: the server has unmapped the window before the
+        // driver touches it.
+        check_reply(
+            || "X11 UnmapWindow failure.",
+            self.0.xcb.unmap_window(self.0.x_window),
+        )
+        .log_err();
         state.renderer.destroy();
 
         let destroy_x_window = maybe!({
