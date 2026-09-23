@@ -17,7 +17,7 @@ use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
     errors::ConnectionError,
-    properties::WmSizeHints,
+    properties::{WmHints, WmSizeHints},
     protocol::{
         sync,
         xinput::{self, ConnectionExt as _},
@@ -551,6 +551,17 @@ impl X11WindowState {
                         xproto::AtomEnum::ATOM,
                         &[atoms._NET_WM_WINDOW_TYPE_NOTIFICATION],
                     ),
+                )?;
+                // A pop-up never takes the keyboard from the window manager:
+                // not when it maps, and not as the fallback target when the
+                // focused window unmaps or iconifies (ICCCM input hint). Window
+                // managers that predate the notification type manage it as a
+                // normal window and would otherwise focus it.
+                let mut hints = WmHints::new();
+                hints.input = Some(false);
+                check_reply(
+                    || "X11 ChangeProperty32 setting WM_HINTS for pop-up failed.",
+                    hints.set(xcb, x_window),
                 )?;
             }
 
