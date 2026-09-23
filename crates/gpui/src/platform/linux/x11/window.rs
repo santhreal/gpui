@@ -492,7 +492,11 @@ impl X11WindowState {
 
             if let Some(size) = params.window_min_size {
                 let mut size_hints = WmSizeHints::new();
-                let min_size = (size.width.0 as i32, size.height.0 as i32);
+                // WM_NORMAL_HINTS are in device pixels, as the bounds above.
+                let min_size = (
+                    (size.width.0 * scale_factor).round() as i32,
+                    (size.height.0 * scale_factor).round() as i32,
+                );
                 size_hints.min_size = Some(min_size);
                 check_reply(
                     || {
