@@ -8,6 +8,7 @@ use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Size, px};
 pub(crate) struct X11Display {
     x_screen_index: usize,
     bounds: Bounds<Pixels>,
+    scale_factor: f32,
     uuid: Uuid,
 }
 
@@ -31,6 +32,7 @@ impl X11Display {
                     height: px(screen.height_in_pixels as f32 / scale_factor),
                 },
             },
+            scale_factor,
             uuid: Uuid::from_bytes([0; 16]),
         })
     }
@@ -47,5 +49,9 @@ impl PlatformDisplay for X11Display {
 
     fn bounds(&self) -> Bounds<Pixels> {
         self.bounds
+    }
+
+    fn scale_factor(&self) -> Option<f32> {
+        Some(self.scale_factor)
     }
 }

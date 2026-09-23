@@ -300,6 +300,16 @@ pub trait PlatformDisplay: Send + Sync + Debug {
         let origin = point(center.x - offset.width, center.y - offset.height);
         Bounds::new(origin, clipped_window_size)
     }
+
+    /// Device pixels per logical pixel for every window on this display,
+    /// on backends that fix one scale for all windows. X11 picks a single
+    /// scale at startup (GPUI_X11_SCALE_FACTOR, else Xft.dpi, else the
+    /// primary monitor's DPI) and reports its display bounds divided by
+    /// it. `None` where each window reports its own scale through
+    /// `Window::scale_factor`.
+    fn scale_factor(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// Metadata for a given [ScreenCaptureSource]
