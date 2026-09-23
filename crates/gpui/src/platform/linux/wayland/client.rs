@@ -388,6 +388,18 @@ impl WaylandClientStatePtr {
             state.common.signal.stop();
         }
     }
+
+    /// Runs the frame a window's frame loop scheduled, unless the window
+    /// closed first.
+    pub(crate) fn run_scheduled_frame(&self, surface_id: &ObjectId) {
+        let Some(client) = self.0.upgrade() else {
+            return;
+        };
+        let window = client.borrow().windows.get(surface_id).cloned();
+        if let Some(window) = window {
+            window.run_scheduled_frame();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -705,6 +717,7 @@ impl LinuxClient for WaylandClient {
             params,
             state.common.appearance,
             parent,
+            state.loop_handle.clone(),
         )?;
         state.windows.insert(surface_id, window.0.clone());
 

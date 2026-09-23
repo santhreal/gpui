@@ -1,5 +1,5 @@
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     ffi::c_void,
     ptr::NonNull,
     rc::Rc,
@@ -7,6 +7,10 @@ use std::{
 };
 
 use blade_graphics as gpu;
+use calloop::{
+    LoopHandle, RegistrationToken,
+    timer::{TimeoutAction, Timer},
+};
 use collections::HashMap;
 use futures::channel::oneshot::Receiver;
 
@@ -124,6 +128,139 @@ pub struct WaylandWindowState {
 pub struct WaylandWindowStatePtr {
     state: Rc<RefCell<WaylandWindowState>>,
     callbacks: Rc<RefCell<Callbacks>>,
+    frame_loop: Rc<FrameLoop>,
+}
+
+/// Runs a window's frames on demand, paced by the compositor's frame
+/// callbacks. A frame requests the next callback only when it presented or
+/// GPUI still has frame demand for the window, so an idle window neither
+/// wakes the client nor keeps the compositor repainting for it.
+pub(crate) struct FrameLoop {
+    surface_id: ObjectId,
+    loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
+    phase: Cell<FramePhase>,
+    timer: Cell<Option<RegistrationToken>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FramePhase {
+    /// Before the first configure, which runs the first frame: attaching a
+    /// buffer to an unconfigured xdg_surface is a protocol error.
+    Unconfigured,
+    /// No frame callback is outstanding and no frame is scheduled.
+    Idle,
+    /// A timer runs the next frame when the event loop next turns.
+    Scheduled,
+    /// A frame is running. `demand` arrived while it ran; `presented`
+    /// records whether it presented a new buffer.
+    Running { demand: bool, presented: bool },
+    /// A committed frame callback runs the next frame.
+    Waiting,
+}
+
+impl FramePhase {
+    /// The phase after GPUI gains frame demand, and whether a frame must be
+    /// scheduled for it.
+    fn wake(self) -> (Self, bool) {
+        match self {
+            Self::Idle => (Self::Scheduled, true),
+            Self::Running { presented, .. } => (
+                Self::Running {
+                    demand: true,
+                    presented,
+                },
+                false,
+            ),
+            Self::Unconfigured | Self::Scheduled | Self::Waiting => (self, false),
+        }
+    }
+
+    fn present(self) -> Self {
+        match self {
+            Self::Running { demand, .. } => Self::Running {
+                demand,
+                presented: true,
+            },
+            phase => phase,
+        }
+    }
+
+    /// The phase after a frame ends, and whether the frame requests a frame
+    /// callback. A frame that presented waits for one before the next frame
+    /// draws, so demand arriving right after a present is paced by the
+    /// compositor instead of drawing frames the display never shows.
+    fn end(self) -> (Self, bool) {
+        match self {
+            Self::Running { demand, presented } if demand || presented => (Self::Waiting, true),
+            _ => (Self::Idle, false),
+        }
+    }
+}
+
+impl FrameLoop {
+    fn new(surface_id: ObjectId, loop_handle: LoopHandle<'static, WaylandClientStatePtr>) -> Self {
+        Self {
+            surface_id,
+            loop_handle,
+            phase: Cell::new(FramePhase::Unconfigured),
+            timer: Cell::new(None),
+        }
+    }
+
+    /// Request a frame: at once after an idle stretch, else from the
+    /// outstanding frame callback or the frame running now.
+    fn wake(&self) {
+        let (phase, schedule) = self.phase.get().wake();
+        if schedule {
+            let surface_id = self.surface_id.clone();
+            // A timer, not an idle callback: calloop polls with no timeout
+            // for idles inserted while idles dispatch, and GPUI's foreground
+            // tasks run inside idle callbacks.
+            match self
+                .loop_handle
+                .insert_source(Timer::immediate(), move |_, _, client| {
+                    client.run_scheduled_frame(&surface_id);
+                    TimeoutAction::Drop
+                }) {
+                Ok(token) => self.timer.set(Some(token)),
+                Err(err) => {
+                    log::error!("Wayland: failed to schedule a frame: {}", err.error);
+                    return;
+                }
+            }
+        }
+        self.phase.set(phase);
+    }
+
+    /// The scheduled frame's timer is running; it drops itself on return.
+    fn fired(&self) {
+        self.timer.set(None);
+    }
+
+    fn begin_frame(&self) {
+        self.cancel();
+        self.phase.set(FramePhase::Running {
+            demand: false,
+            presented: false,
+        });
+    }
+
+    fn presented(&self) {
+        self.phase.set(self.phase.get().present());
+    }
+
+    /// Ends the running frame; returns whether it requests a frame callback.
+    fn end_frame(&self) -> bool {
+        let (phase, request) = self.phase.get().end();
+        self.phase.set(phase);
+        request
+    }
+
+    fn cancel(&self) {
+        if let Some(token) = self.timer.take() {
+            self.loop_handle.remove(token);
+        }
+    }
 }
 
 impl WaylandWindowState {
@@ -245,6 +382,7 @@ pub enum ImeInput {
 
 impl Drop for WaylandWindow {
     fn drop(&mut self) {
+        self.0.frame_loop.cancel();
         let mut state = self.0.state.borrow_mut();
         let surface_id = state.surface.id();
         let client = state.client.clone();
@@ -293,6 +431,7 @@ impl WaylandWindow {
         params: WindowParams,
         appearance: WindowAppearance,
         parent: Option<XdgToplevel>,
+        loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     ) -> anyhow::Result<(Self, ObjectId)> {
         let surface = globals.compositor.create_surface(&globals.qh, ());
         let xdg_surface = globals
@@ -340,6 +479,7 @@ impl WaylandWindow {
                 params,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
+            frame_loop: Rc::new(FrameLoop::new(surface.id(), loop_handle)),
         });
 
         // Kick things off
@@ -366,12 +506,15 @@ impl WaylandWindowStatePtr {
         Rc::ptr_eq(&self.state, &other.state)
     }
 
+    /// Runs a frame: on the first configure, a frame callback, or the
+    /// timer [`FrameLoop::wake`] scheduled.
     pub fn frame(&self) {
-        let mut state = self.state.borrow_mut();
-        state.surface.frame(&state.globals.qh, state.surface.id());
-        state.resize_throttle = false;
-        let throttled = state.throttled_configure.take();
-        drop(state);
+        self.frame_loop.begin_frame();
+        let throttled = {
+            let mut state = self.state.borrow_mut();
+            state.resize_throttle = false;
+            state.throttled_configure.take()
+        };
 
         // Before the frame renders: the frame then draws the latest size
         // and its commit carries the configure's ack.
@@ -383,6 +526,20 @@ impl WaylandWindowStatePtr {
         if let Some(fun) = cb.request_frame.as_mut() {
             fun(Default::default());
         }
+        drop(cb);
+
+        // The commit also applies state set outside a draw, such as a
+        // configure's ack when the configure left the size unchanged.
+        let state = self.state.borrow();
+        if self.frame_loop.end_frame() {
+            state.surface.frame(&state.globals.qh, state.surface.id());
+        }
+        state.surface.commit();
+    }
+
+    pub fn run_scheduled_frame(&self) {
+        self.frame_loop.fired();
+        self.frame();
     }
 
     pub fn handle_xdg_surface_event(&self, event: xdg_surface::Event) {
@@ -413,6 +570,9 @@ impl WaylandWindowStatePtr {
             match configure {
                 Some(configure) if configure.resizing && state.resize_throttle => {
                     state.throttled_configure = Some((configure, serial));
+                    drop(state);
+                    // The next frame applies it, and a frame must come.
+                    self.frame_loop.wake();
                 }
                 configure => {
                     // Newer than a throttled configure, which must not be
@@ -474,11 +634,16 @@ impl WaylandWindowStatePtr {
             window_geometry.size.height,
         );
 
-        let request_frame_callback = !state.acknowledged_first_configure;
-        if request_frame_callback {
+        let first_configure = !state.acknowledged_first_configure;
+        if first_configure {
             state.acknowledged_first_configure = true;
             drop(state);
             self.frame();
+        } else {
+            drop(state);
+            // The ack takes effect on the next commit, which a frame makes
+            // even when the configure changed nothing that redraws.
+            self.frame_loop.wake();
         }
     }
 
@@ -898,6 +1063,8 @@ impl PlatformWindow for WaylandWindow {
             .executor
             .spawn(async move { state_ptr.resize(size) })
             .detach();
+        drop(state);
+        self.0.frame_loop.wake();
     }
 
     fn scale_factor(&self) -> f32 {
@@ -993,6 +1160,7 @@ impl PlatformWindow for WaylandWindow {
         let mut state = self.borrow_mut();
         state.background_appearance = background_appearance;
         update_window(state);
+        self.0.frame_loop.wake();
     }
 
     fn minimize(&self) {
@@ -1019,6 +1187,15 @@ impl PlatformWindow for WaylandWindow {
 
     fn is_fullscreen(&self) -> bool {
         self.borrow().fullscreen
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let frame_loop = Rc::downgrade(&self.0.frame_loop);
+        Some(Rc::new(move || {
+            if let Some(frame_loop) = frame_loop.upgrade() {
+                frame_loop.wake();
+            }
+        }))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
@@ -1063,11 +1240,7 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         state.renderer.draw(scene);
-    }
-
-    fn completed_frame(&self) {
-        let state = self.borrow();
-        state.surface.commit();
+        self.0.frame_loop.presented();
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1117,6 +1290,7 @@ impl PlatformWindow for WaylandWindow {
         if let Some(decoration) = state.decoration.as_ref() {
             decoration.set_mode(decorations.to_xdg());
             update_window(state);
+            self.0.frame_loop.wake();
         }
     }
 
@@ -1129,6 +1303,7 @@ impl PlatformWindow for WaylandWindow {
         if Some(inset) != state.client_inset {
             state.client_inset = Some(inset);
             update_window(state);
+            self.0.frame_loop.wake();
         }
     }
 
@@ -1259,4 +1434,198 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FramePhase;
+
+    /// A [`FramePhase`] with what surrounds it: GPUI's frame demand, the
+    /// event loop's scheduled-frame timer, and the compositor's frame
+    /// callbacks. The tests explore every state these can reach.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct World {
+        phase: FramePhase,
+        configured: bool,
+        /// Demand the next frame must serve.
+        dirty: bool,
+        timer: bool,
+        callbacks: u32,
+        /// A frame presented since the compositor last delivered a callback.
+        unpaced: bool,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// GPUI gains demand between frames.
+        Demand,
+        /// The first configure arrives and runs the first frame.
+        Configure,
+        /// The scheduled timer runs a frame, which leaves demand behind
+        /// when `true`, as an animation's next-frame callback does.
+        Timer(bool),
+        /// The compositor delivers the frame callback, which runs a frame.
+        Callback(bool),
+    }
+
+    const STEPS: [Step; 6] = [
+        Step::Demand,
+        Step::Configure,
+        Step::Timer(false),
+        Step::Timer(true),
+        Step::Callback(false),
+        Step::Callback(true),
+    ];
+
+    impl World {
+        fn new() -> Self {
+            Self {
+                phase: FramePhase::Unconfigured,
+                configured: false,
+                dirty: false,
+                timer: false,
+                callbacks: 0,
+                unpaced: false,
+            }
+        }
+
+        fn wake(&mut self) {
+            let (phase, schedule) = self.phase.wake();
+            self.phase = phase;
+            if schedule {
+                assert!(!self.timer, "a second timer for one frame: {self:?}");
+                self.timer = true;
+            }
+        }
+
+        /// A frame as `WaylandWindowStatePtr::frame` runs one: GPUI draws
+        /// when dirty, and `demand` arrives while the frame runs.
+        fn frame(&mut self, demand: bool) {
+            self.phase = FramePhase::Running {
+                demand: false,
+                presented: false,
+            };
+            if std::mem::take(&mut self.dirty) {
+                assert!(
+                    !self.unpaced,
+                    "presented twice with no frame callback between: {self:?}"
+                );
+                self.phase = self.phase.present();
+                self.unpaced = true;
+            }
+            if demand {
+                self.dirty = true;
+                self.wake();
+            }
+            let (phase, request) = self.phase.end();
+            self.phase = phase;
+            self.callbacks += u32::from(request);
+        }
+
+        /// The world after `step`, or `None` when `step` cannot happen now.
+        fn step(mut self, step: Step) -> Option<Self> {
+            match step {
+                Step::Demand => {
+                    self.dirty = true;
+                    self.wake();
+                }
+                Step::Configure if !self.configured => {
+                    self.configured = true;
+                    self.frame(false);
+                }
+                Step::Timer(demand) if self.timer => {
+                    self.timer = false;
+                    self.frame(demand);
+                }
+                Step::Callback(demand) if self.callbacks > 0 => {
+                    self.callbacks -= 1;
+                    self.unpaced = false;
+                    self.frame(demand);
+                }
+                _ => return None,
+            }
+            Some(self)
+        }
+
+        fn check(&self) {
+            assert!(
+                self.configured || self.phase == FramePhase::Unconfigured,
+                "a frame scheduled before the first configure: {self:?}"
+            );
+            assert_eq!(
+                self.timer,
+                self.phase == FramePhase::Scheduled,
+                "timer and phase disagree: {self:?}"
+            );
+            assert_eq!(
+                self.callbacks,
+                u32::from(self.phase == FramePhase::Waiting),
+                "frame callbacks and phase disagree: {self:?}"
+            );
+            if self.dirty {
+                assert!(
+                    matches!(
+                        self.phase,
+                        FramePhase::Unconfigured | FramePhase::Scheduled | FramePhase::Waiting
+                    ),
+                    "demand with no frame coming: {self:?}"
+                );
+            }
+        }
+    }
+
+    fn reachable() -> Vec<World> {
+        let mut seen = vec![World::new()];
+        let mut next = 0;
+        while let Some(&world) = seen.get(next) {
+            next += 1;
+            for step in STEPS {
+                if let Some(after) = world.step(step) {
+                    after.check();
+                    if !seen.contains(&after) {
+                        seen.push(after);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn every_reachable_state_keeps_the_frame_loop_invariants() {
+        let states = reachable();
+        for phase in [
+            FramePhase::Unconfigured,
+            FramePhase::Idle,
+            FramePhase::Scheduled,
+            FramePhase::Waiting,
+        ] {
+            assert!(
+                states.iter().any(|world| world.phase == phase),
+                "{phase:?} is unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_loop_parks_within_two_frames_once_demand_stops() {
+        for mut world in reachable() {
+            let mut frames = 0;
+            while world.timer || world.callbacks > 0 {
+                let step = if world.timer {
+                    Step::Timer(false)
+                } else {
+                    Step::Callback(false)
+                };
+                world = world.step(step).expect("a pending frame can run");
+                world.check();
+                frames += 1;
+                assert!(frames <= 2, "frames keep running with no demand: {world:?}");
+            }
+            assert!(
+                matches!(world.phase, FramePhase::Idle | FramePhase::Unconfigured),
+                "{world:?}"
+            );
+        }
+    }
 }
