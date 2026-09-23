@@ -4,6 +4,7 @@ use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle, RegistrationToken,
     generic::{FdWrapper, Generic},
+    timer::{TimeoutAction, Timer},
 };
 use collections::HashMap;
 use core::str;
@@ -11,8 +12,9 @@ use http_client::Url;
 use log::Level;
 use smallvec::SmallVec;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashSet},
+    mem,
     ops::Deref,
     path::PathBuf,
     rc::{Rc, Weak},
@@ -80,7 +82,6 @@ const GPUI_X11_SCALE_FACTOR_ENV: &str = "GPUI_X11_SCALE_FACTOR";
 
 pub(crate) struct WindowRef {
     window: X11WindowStatePtr,
-    refresh_state: Option<RefreshState>,
     expose_event_received: bool,
     last_visibility: Visibility,
     is_mapped: bool,
@@ -100,14 +101,127 @@ impl Deref for WindowRef {
     }
 }
 
-enum RefreshState {
-    Hidden {
-        refresh_rate: Duration,
-    },
-    PeriodicRefresh {
-        refresh_rate: Duration,
-        event_loop_token: RegistrationToken,
-    },
+const DEFAULT_REFRESH_RATE: Duration = Duration::from_micros(1_000_000 / 60);
+
+/// Paces a visible window's frames at the display refresh rate while GPUI
+/// has frame demand for it: a dirty view, a pending present, or a
+/// next-frame callback. A frame that leaves no demand drops the refresh
+/// timer, and the window costs no wakeups until GPUI calls [`Self::wake`].
+pub(crate) struct FrameLoop {
+    x_window: xproto::Window,
+    loop_handle: LoopHandle<'static, X11Client>,
+    visible: Cell<bool>,
+    phase: Cell<FramePhase>,
+    timer: Cell<Option<RegistrationToken>>,
+    refresh_rate: Cell<Option<Duration>>,
+    last_frame: Cell<Option<Instant>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FramePhase {
+    /// No refresh timer is registered.
+    Idle,
+    /// A refresh timer is registered and has not fired.
+    Armed,
+    /// The refresh timer is running a frame.
+    Ticking,
+    /// Frame demand arrived while a frame ran: the timer fires again.
+    Rearm,
+}
+
+impl FrameLoop {
+    pub(crate) fn new(
+        x_window: xproto::Window,
+        loop_handle: LoopHandle<'static, X11Client>,
+    ) -> Self {
+        Self {
+            x_window,
+            loop_handle,
+            visible: Cell::new(false),
+            phase: Cell::new(FramePhase::Idle),
+            timer: Cell::new(None),
+            refresh_rate: Cell::new(None),
+            last_frame: Cell::new(None),
+        }
+    }
+
+    /// Request a frame. A window the X server is not presenting draws when
+    /// it is next shown instead.
+    pub(crate) fn wake(&self) {
+        if !self.visible.get() {
+            return;
+        }
+        match self.phase.get() {
+            FramePhase::Idle => self.arm(),
+            FramePhase::Ticking => self.phase.set(FramePhase::Rearm),
+            FramePhase::Armed | FramePhase::Rearm => {}
+        }
+    }
+
+    pub(crate) fn hide(&self) {
+        self.visible.set(false);
+        // A running frame drops its own timer when it ends.
+        if self.phase.get() == FramePhase::Armed {
+            self.phase.set(FramePhase::Idle);
+            if let Some(token) = self.timer.take() {
+                self.loop_handle.remove(token);
+            }
+        }
+    }
+
+    fn show(&self) {
+        if !self.visible.replace(true) {
+            self.wake();
+        }
+    }
+
+    fn interval(&self) -> Duration {
+        self.refresh_rate.get().unwrap_or(DEFAULT_REFRESH_RATE)
+    }
+
+    fn arm(&self) {
+        // Demand after an idle stretch draws at once. Demand within a
+        // refresh interval of the last frame waits the interval out, so
+        // frames never outpace the display however fast input arrives.
+        let now = Instant::now();
+        let deadline = self
+            .last_frame
+            .get()
+            .map_or(now, |last| (last + self.interval()).max(now));
+        let x_window = self.x_window;
+        match self.loop_handle.insert_source(
+            Timer::from_deadline(deadline),
+            move |deadline, _, client| client.run_frame(x_window, deadline),
+        ) {
+            Ok(token) => {
+                self.timer.set(Some(token));
+                self.phase.set(FramePhase::Armed);
+            }
+            Err(err) => log::error!("X11: failed to schedule a frame: {}", err.error),
+        }
+    }
+
+    fn begin_frame(&self) {
+        self.phase.set(FramePhase::Ticking);
+        self.last_frame.set(Some(Instant::now()));
+    }
+
+    fn end_frame(&self, deadline: Instant) -> TimeoutAction {
+        if self.visible.get() && self.phase.get() == FramePhase::Rearm {
+            self.phase.set(FramePhase::Armed);
+            // Skip the intervals a slow frame overran.
+            let interval = self.interval();
+            let now = Instant::now();
+            let mut next = deadline;
+            while next <= now {
+                next += interval;
+            }
+            return TimeoutAction::ToInstant(next);
+        }
+        self.phase.set(FramePhase::Idle);
+        self.timer.set(None);
+        TimeoutAction::Drop
+    }
 }
 
 #[derive(Debug)]
@@ -232,13 +346,7 @@ impl X11ClientStatePtr {
         };
         let mut state = client.0.borrow_mut();
 
-        if let Some(window_ref) = state.windows.remove(&x_window)
-            && let Some(RefreshState::PeriodicRefresh {
-                event_loop_token, ..
-            }) = window_ref.refresh_state
-        {
-            state.loop_handle.remove(event_loop_token);
-        }
+        state.windows.remove(&x_window);
         if state.mouse_focused_window == Some(x_window) {
             state.mouse_focused_window = None;
         }
@@ -613,6 +721,7 @@ impl X11Client {
                 let mut state = self.0.borrow_mut();
                 if let Some(window) = state.windows.get_mut(&window) {
                     window.expose_event_received = true;
+                    window.window.frame_loop.wake();
                 }
             }
 
@@ -667,6 +776,23 @@ impl X11Client {
             }
         }
         Ok(())
+    }
+
+    fn run_frame(&self, x_window: xproto::Window, deadline: Instant) -> TimeoutAction {
+        let (window, expose_event_received) = {
+            let mut state = self.0.borrow_mut();
+            let Some(window_ref) = state.windows.get_mut(&x_window) else {
+                return TimeoutAction::Drop;
+            };
+            let expose_event_received = mem::take(&mut window_ref.expose_event_received);
+            (window_ref.window.clone(), expose_event_received)
+        };
+        window.frame_loop.begin_frame();
+        window.refresh(RequestFrameOptions {
+            require_presentation: expose_event_received,
+            force_render: false,
+        });
+        window.frame_loop.end_frame(deadline)
     }
 
     pub fn enable_ime(&self) {
@@ -1474,6 +1600,7 @@ impl LinuxClient for X11Client {
             state.scale_factor,
             state.common.appearance,
             parent_window,
+            Rc::new(FrameLoop::new(x_window, state.loop_handle.clone())),
         )?;
         check_reply(
             || "Failed to set XdndAware property",
@@ -1490,7 +1617,6 @@ impl LinuxClient for X11Client {
 
         let window_ref = WindowRef {
             window: window.0.clone(),
-            refresh_state: None,
             expose_event_received: false,
             last_visibility: Visibility::UNOBSCURED,
             is_mapped: false,
@@ -1607,7 +1733,16 @@ impl LinuxClient for X11Client {
             return;
         };
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        let xcb_connection = self.0.borrow().xcb_connection.clone();
+        event_loop
+            .run(None, &mut self.clone(), |client| {
+                // Waiting on a reply reads every event ahead of it into xcb's
+                // queue, and a queued event leaves the socket unreadable, so
+                // the event source would not fire for it. Drain the queue
+                // before sleeping: an idle window has no frame timer to do it.
+                client.process_x11_events(&xcb_connection).log_err();
+            })
+            .log_err();
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
@@ -1699,121 +1834,60 @@ impl X11ClientState {
     }
 
     fn update_refresh_loop(&mut self, x_window: xproto::Window) {
-        let Some(window_ref) = self.windows.get_mut(&x_window) else {
+        let Some(window_ref) = self.windows.get(&x_window) else {
             return;
         };
+        let frame_loop = window_ref.window.frame_loop.clone();
         let is_visible = window_ref.is_mapped
             && !matches!(window_ref.last_visibility, Visibility::FULLY_OBSCURED);
-        match (is_visible, window_ref.refresh_state.take()) {
-            (false, refresh_state @ Some(RefreshState::Hidden { .. }))
-            | (false, refresh_state @ None)
-            | (true, refresh_state @ Some(RefreshState::PeriodicRefresh { .. })) => {
-                window_ref.refresh_state = refresh_state;
-            }
-            (
-                false,
-                Some(RefreshState::PeriodicRefresh {
-                    refresh_rate,
-                    event_loop_token,
-                }),
-            ) => {
-                self.loop_handle.remove(event_loop_token);
-                window_ref.refresh_state = Some(RefreshState::Hidden { refresh_rate });
-            }
-            (true, Some(RefreshState::Hidden { refresh_rate })) => {
-                let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
-                let Some(window_ref) = self.windows.get_mut(&x_window) else {
-                    return;
-                };
-                window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
-                    refresh_rate,
-                    event_loop_token,
-                });
-            }
-            (true, None) => {
-                let Some(screen_resources) = get_reply(
-                    || "Failed to get screen resources",
-                    self.xcb_connection
-                        .randr_get_screen_resources_current(x_window),
-                )
-                .log_err() else {
-                    return;
-                };
-
-                // Ideally this would be re-queried when the window changes screens, but there
-                // doesn't seem to be an efficient / straightforward way to do this. Should also be
-                // updated when screen configurations change.
-                let mode_info = screen_resources.crtcs.iter().find_map(|crtc| {
-                    let crtc_info = self
-                        .xcb_connection
-                        .randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME)
-                        .ok()?
-                        .reply()
-                        .ok()?;
-
-                    screen_resources
-                        .modes
-                        .iter()
-                        .find(|m| m.id == crtc_info.mode)
-                });
-                let refresh_rate = match mode_info {
-                    Some(mode_info) => mode_refresh_rate(mode_info),
-                    None => {
-                        log::error!(
-                            "Failed to get screen mode info from xrandr, \
-                            defaulting to 60hz refresh rate."
-                        );
-                        Duration::from_micros(1_000_000 / 60)
-                    }
-                };
-
-                let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
-                let Some(window_ref) = self.windows.get_mut(&x_window) else {
-                    return;
-                };
-                window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
-                    refresh_rate,
-                    event_loop_token,
-                });
-            }
+        if !is_visible {
+            frame_loop.hide();
+            return;
         }
+        if frame_loop.refresh_rate.get().is_none() {
+            frame_loop
+                .refresh_rate
+                .set(Some(self.display_refresh_rate(x_window)));
+        }
+        frame_loop.show();
     }
 
-    #[must_use]
-    fn start_refresh_loop(
-        &self,
-        x_window: xproto::Window,
-        refresh_rate: Duration,
-    ) -> RegistrationToken {
-        self.loop_handle
-            .insert_source(calloop::timer::Timer::immediate(), {
-                move |mut instant, (), client| {
-                    let xcb_connection = {
-                        let mut state = client.0.borrow_mut();
-                        let xcb_connection = state.xcb_connection.clone();
-                        if let Some(window) = state.windows.get_mut(&x_window) {
-                            let expose_event_received = window.expose_event_received;
-                            window.expose_event_received = false;
-                            let window = window.window.clone();
-                            drop(state);
-                            window.refresh(RequestFrameOptions {
-                                require_presentation: expose_event_received,
-                                force_render: false,
-                            });
-                        }
-                        xcb_connection
-                    };
-                    client.process_x11_events(&xcb_connection).log_err();
+    fn display_refresh_rate(&self, x_window: xproto::Window) -> Duration {
+        let Some(screen_resources) = get_reply(
+            || "Failed to get screen resources",
+            self.xcb_connection
+                .randr_get_screen_resources_current(x_window),
+        )
+        .log_err() else {
+            return DEFAULT_REFRESH_RATE;
+        };
 
-                    // Take into account that some frames have been skipped
-                    let now = Instant::now();
-                    while instant < now {
-                        instant += refresh_rate;
-                    }
-                    calloop::timer::TimeoutAction::ToInstant(instant)
-                }
-            })
-            .expect("Failed to initialize window refresh timer")
+        // Ideally this would be re-queried when the window changes screens, but there
+        // doesn't seem to be an efficient / straightforward way to do this. Should also be
+        // updated when screen configurations change.
+        let mode_info = screen_resources.crtcs.iter().find_map(|crtc| {
+            let crtc_info = self
+                .xcb_connection
+                .randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME)
+                .ok()?
+                .reply()
+                .ok()?;
+
+            screen_resources
+                .modes
+                .iter()
+                .find(|m| m.id == crtc_info.mode)
+        });
+        match mode_info {
+            Some(mode_info) => mode_refresh_rate(mode_info),
+            None => {
+                log::error!(
+                    "Failed to get screen mode info from xrandr, \
+                    defaulting to 60hz refresh rate."
+                );
+                DEFAULT_REFRESH_RATE
+            }
+        }
     }
 
     fn get_cursor_icon(&mut self, style: CursorStyle) -> Option<xproto::Cursor> {

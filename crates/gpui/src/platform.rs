@@ -500,6 +500,14 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
+    /// A callback that requests a frame, for platforms that stop requesting
+    /// frames for a window with no frame demand. GPUI calls it on the main
+    /// thread, possibly from inside an update, whenever the window gains
+    /// demand: a view becomes dirty, a next-frame callback is registered,
+    /// or demand outlives the frame being drawn. It must not re-enter GPUI.
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        None
+    }
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);

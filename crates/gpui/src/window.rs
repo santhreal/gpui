@@ -95,6 +95,7 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    pub platform_waker: Option<Rc<dyn Fn()>>,
 }
 
 #[derive(Clone)]
@@ -109,6 +110,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                platform_waker: None,
             })),
         }
     }
@@ -117,8 +119,15 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
+            let waker = (!inner.dirty)
+                .then(|| inner.platform_waker.clone())
+                .flatten();
             inner.dirty = true;
+            drop(inner);
             cx.push_effect(Effect::Notify { emitter: entity });
+            if let Some(waker) = waker {
+                waker();
+            }
             true
         } else {
             false
@@ -130,7 +139,35 @@ impl WindowInvalidator {
     }
 
     pub fn set_dirty(&self, dirty: bool) {
-        self.inner.borrow_mut().dirty = dirty
+        let mut inner = self.inner.borrow_mut();
+        let waker = (dirty && !inner.dirty)
+            .then(|| inner.platform_waker.clone())
+            .flatten();
+        inner.dirty = dirty;
+        drop(inner);
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn set_platform_waker(&self, waker: Option<Rc<dyn Fn()>>) {
+        let mut inner = self.inner.borrow_mut();
+        inner.platform_waker = waker;
+        let waker = inner.dirty.then(|| inner.platform_waker.clone()).flatten();
+        drop(inner);
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    /// Request a frame from a platform that parks idle windows. Frame
+    /// demand that does not dirty the window, such as a next-frame
+    /// callback, reaches the platform only through this.
+    pub fn wake_platform(&self) {
+        let waker = self.inner.borrow().platform_waker.clone();
+        if let Some(waker) = waker {
+            waker();
+        }
     }
 
     pub fn set_phase(&self, phase: DrawPhase) {
@@ -1024,11 +1061,11 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
             move |request_frame_options| {
-                let next_frame_callbacks = next_frame_callbacks.take();
-                if !next_frame_callbacks.is_empty() {
+                let pending_callbacks = next_frame_callbacks.take();
+                if !pending_callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
-                            for callback in next_frame_callbacks {
+                            for callback in pending_callbacks {
                                 callback(window, cx);
                             }
                         })
@@ -1036,10 +1073,14 @@ impl Window {
                 }
 
                 // Keep presenting the current scene for 1 extra second since the
-                // last input to prevent the display from underclocking the refresh rate.
-                let needs_present = request_frame_options.require_presentation
+                // last input to prevent the display from underclocking the refresh
+                // rate. Only macOS lowers the refresh rate of a display a window
+                // stops presenting to; elsewhere the extra presents redraw an
+                // unchanged scene and keep a parked window's frame source running.
+                let present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get()
+                    || (cfg!(target_os = "macos")
+                        && active.get()
                         && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
@@ -1053,10 +1094,22 @@ impl Window {
                             })
                             .log_err();
                     })
-                } else if needs_present {
+                } else if present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
+                }
+
+                // A platform that parks idle windows delivers the next frame
+                // only after a wake. Demand that outlived this frame, a view
+                // dirtied while drawing or a next-frame callback registered by
+                // an animation, wakes it before the frame completes, so the
+                // platform settles its frame source knowing about the demand.
+                if invalidator.is_dirty()
+                    || needs_present.get()
+                    || !next_frame_callbacks.borrow().is_empty()
+                {
+                    invalidator.wake_platform();
                 }
 
                 handle
@@ -1066,6 +1119,7 @@ impl Window {
                     .log_err();
             }
         }));
+        invalidator.set_platform_waker(platform_window.frame_waker());
         platform_window.on_resize(Box::new({
             let mut cx = cx.to_async();
             move |_, _| {
@@ -1644,6 +1698,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.invalidator.wake_platform();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.

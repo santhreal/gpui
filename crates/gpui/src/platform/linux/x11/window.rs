@@ -32,7 +32,7 @@ use std::{
     sync::Arc,
 };
 
-use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
+use super::{FrameLoop, X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
 
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
@@ -290,6 +290,7 @@ pub(crate) struct X11WindowStatePtr {
     pub(crate) callbacks: Rc<RefCell<Callbacks>>,
     xcb: Rc<XCBConnection>,
     pub(crate) x_window: xproto::Window,
+    pub(crate) frame_loop: Rc<FrameLoop>,
 }
 
 impl rwh::HasWindowHandle for RawWindow {
@@ -728,6 +729,9 @@ pub(crate) struct X11Window(pub X11WindowStatePtr);
 impl Drop for X11Window {
     fn drop(&mut self) {
         let mut state = self.0.state.borrow_mut();
+        // The client forgets the window in a deferred task. Frames that
+        // fire before it runs would draw a destroyed window.
+        self.0.frame_loop.hide();
         // Unmap before the renderer goes. Tearing down the swapchain of
         // a mapped window leaves the window's storage black, and a
         // compositor paints that for a frame before the DestroyWindow
@@ -793,6 +797,7 @@ impl X11Window {
         scale_factor: f32,
         appearance: WindowAppearance,
         parent_window: Option<xproto::Window>,
+        frame_loop: Rc<FrameLoop>,
     ) -> anyhow::Result<Self> {
         let ptr = X11WindowStatePtr {
             state: Rc::new(RefCell::new(X11WindowState::new(
@@ -813,6 +818,7 @@ impl X11Window {
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             xcb: xcb.clone(),
             x_window,
+            frame_loop,
         };
 
         let state = ptr.state.borrow_mut();
@@ -1463,6 +1469,15 @@ impl PlatformWindow for X11Window {
 
     fn is_fullscreen(&self) -> bool {
         self.0.state.borrow().fullscreen
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let frame_loop = Rc::downgrade(&self.0.frame_loop);
+        Some(Rc::new(move || {
+            if let Some(frame_loop) = frame_loop.upgrade() {
+                frame_loop.wake();
+            }
+        }))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
