@@ -46,8 +46,7 @@ use super::{
     ButtonOrScroll, ScrollDirection, X11Display, X11WindowStatePtr, XcbAtoms, XimCallbackEvent,
     XimHandler, button_or_scroll_from_event_detail, check_reply,
     clipboard::{self, Clipboard},
-    get_reply, get_valuator_axis_index, handle_connection_error, modifiers_from_state,
-    pressed_button_from_mask,
+    get_reply, get_valuator_axis_index, modifiers_from_state, pressed_button_from_mask,
 };
 
 use crate::platform::{
@@ -693,11 +692,16 @@ impl X11Client {
                     Ok(None) => {
                         break;
                     }
-                    Err(err) => {
-                        let err = handle_connection_error(err);
-                        log::warn!("error while polling for X11 events: {err:?}");
-                        break;
+                    Err(ConnectionError::ParseError(err)) => {
+                        // One malformed event: the connection still works.
+                        log::warn!("skipping an X11 event that failed to parse: {err}");
                     }
+                    // libxcb keeps a failed connection failed: every later
+                    // poll fails the same way at once, and the socket stays
+                    // readable, so this source would fire in a busy loop.
+                    // Fail the source instead, which ends the event loop, as
+                    // the Wayland client's does when its socket closes.
+                    Err(err) => return Err(err.into()),
                 }
             }
 
