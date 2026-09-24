@@ -9,7 +9,10 @@ pub struct BladeContext {
 }
 
 impl BladeContext {
-    pub fn new() -> anyhow::Result<Self> {
+    /// A context that presents to `window_system` alone, or to every
+    /// window system the platform supports when it is `None`; see
+    /// `blade_graphics::ContextDesc::window_system`.
+    pub fn new(window_system: Option<gpu::WindowSystem>) -> anyhow::Result<Self> {
         let device_id_forced = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
                 .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
@@ -25,6 +28,7 @@ impl BladeContext {
             unsafe {
                 gpu::Context::init(gpu::ContextDesc {
                     presentation: true,
+                    window_system,
                     validation: false,
                     device_id: device_id_forced.unwrap_or(0),
                     ..Default::default()

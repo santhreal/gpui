@@ -513,7 +513,8 @@ impl X11Client {
             .to_string();
         let keyboard_layout = LinuxKeyboardLayout::new(layout_name.into());
 
-        let gpu_context = BladeContext::new().context("Unable to init GPU context")?;
+        let gpu_context = BladeContext::new(Some(blade_graphics::WindowSystem::Xcb))
+            .context("Unable to init GPU context")?;
 
         let resource_database = x11rb::resource_manager::new_from_default(&xcb_connection)
             .context("Failed to create resource database")?;

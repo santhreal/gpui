@@ -510,7 +510,8 @@ impl WaylandClient {
             })
             .unwrap();
 
-        let gpu_context = BladeContext::new().expect("Unable to init GPU context");
+        let gpu_context = BladeContext::new(Some(blade_graphics::WindowSystem::Wayland))
+            .expect("Unable to init GPU context");
 
         let seat = seat.unwrap();
         let globals = Globals::new(

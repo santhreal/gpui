@@ -9,7 +9,7 @@ pub struct Context {
 impl Default for Context {
     fn default() -> Self {
         Self {
-            inner: BladeContext::new().unwrap(),
+            inner: BladeContext::new(None).unwrap(),
         }
     }
 }
