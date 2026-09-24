@@ -122,7 +122,12 @@ struct PathRasterizationVertex {
     bounds: Bounds<ScaledPixels>,
 }
 
+/// The render pipelines of one kind of surface. They depend on the
+/// surface's format and alpha mode and the path sample count, and on
+/// nothing about the window, so every window that presents the same way
+/// draws with one set; see [`BladePipelineCache`].
 struct BladePipelines {
+    gpu: Arc<gpu::Context>,
     quads: gpu::RenderPipeline,
     shadows: gpu::RenderPipeline,
     path_rasterization: gpu::RenderPipeline,
@@ -134,7 +139,11 @@ struct BladePipelines {
 }
 
 impl BladePipelines {
-    fn new(gpu: &gpu::Context, surface_info: gpu::SurfaceInfo, path_sample_count: u32) -> Self {
+    fn new(
+        gpu: &Arc<gpu::Context>,
+        surface_info: gpu::SurfaceInfo,
+        path_sample_count: u32,
+    ) -> Self {
         use gpu::ShaderData as _;
 
         log::info!(
@@ -167,6 +176,7 @@ impl BladePipelines {
         }];
 
         Self {
+            gpu: Arc::clone(gpu),
             quads: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
                 name: "quads",
                 data_layouts: &[&ShaderQuadsData::layout()],
@@ -302,8 +312,11 @@ impl BladePipelines {
             }),
         }
     }
+}
 
-    fn destroy(&mut self, gpu: &gpu::Context) {
+impl Drop for BladePipelines {
+    fn drop(&mut self) {
+        let gpu = &self.gpu;
         gpu.destroy_render_pipeline(&mut self.quads);
         gpu.destroy_render_pipeline(&mut self.shadows);
         gpu.destroy_render_pipeline(&mut self.path_rasterization);
@@ -315,22 +328,57 @@ impl BladePipelines {
     }
 }
 
+/// What a pipeline set depends on.
+#[derive(Clone, Copy, PartialEq)]
+struct PipelineKey {
+    surface: gpu::SurfaceInfo,
+    path_sample_count: u32,
+}
+
+/// The pipeline sets a GPU context has built, one per [`PipelineKey`].
+/// Building a set compiles the WGSL shaders to SPIR-V and the driver's
+/// code, several milliseconds of a window's open; a window whose key a
+/// set exists for takes that set instead. A set lives as long as the
+/// context: a process has one or two keys.
+#[derive(Default)]
+pub(super) struct BladePipelineCache {
+    sets: parking_lot::Mutex<Vec<(PipelineKey, Arc<BladePipelines>)>>,
+}
+
+impl BladePipelineCache {
+    fn get(
+        &self,
+        gpu: &Arc<gpu::Context>,
+        surface: gpu::SurfaceInfo,
+        path_sample_count: u32,
+    ) -> Arc<BladePipelines> {
+        let key = PipelineKey {
+            surface,
+            path_sample_count,
+        };
+        let mut sets = self.sets.lock();
+        if let Some((_, set)) = sets.iter().find(|(k, _)| *k == key) {
+            return Arc::clone(set);
+        }
+        let set = Arc::new(BladePipelines::new(gpu, surface, path_sample_count));
+        sets.push((key, Arc::clone(&set)));
+        set
+    }
+}
+
 pub struct BladeSurfaceConfig {
     pub size: gpu::Extent,
     pub transparent: bool,
 }
 
-//Note: we could see some of these fields moved into `BladeContext`
-// so that they are shared between windows. E.g. `pipelines`.
-// But that is complicated by the fact that pipelines depend on
-// the format and alpha mode.
 pub struct BladeRenderer {
     gpu: Arc<gpu::Context>,
     surface: gpu::Surface,
     surface_config: gpu::SurfaceConfig,
     command_encoder: gpu::CommandEncoder,
     last_sync_point: Option<gpu::SyncPoint>,
-    pipelines: BladePipelines,
+    pipeline_cache: Arc<BladePipelineCache>,
+    pipelines: Arc<BladePipelines>,
     instance_belt: BufferBelt,
     atlas: Arc<BladeAtlas>,
     atlas_sampler: gpu::Sampler,
@@ -367,7 +415,8 @@ impl BladeRenderer {
             buffer_count: 2,
         });
         let rendering_parameters = RenderingParameters::from_env(context);
-        let pipelines = BladePipelines::new(
+        let pipeline_cache = Arc::clone(&context.pipelines);
+        let pipelines = pipeline_cache.get(
             &context.gpu,
             surface.info(),
             rendering_parameters.path_sample_count,
@@ -416,6 +465,7 @@ impl BladeRenderer {
             surface_config,
             command_encoder,
             last_sync_point: None,
+            pipeline_cache,
             pipelines,
             instance_belt,
             atlas,
@@ -517,8 +567,7 @@ impl BladeRenderer {
             self.surface_config.transparent = transparent;
             self.gpu
                 .reconfigure_surface(&mut self.surface, self.surface_config);
-            self.pipelines.destroy(&self.gpu);
-            self.pipelines = BladePipelines::new(
+            self.pipelines = self.pipeline_cache.get(
                 &self.gpu,
                 self.surface.info(),
                 self.rendering_parameters.path_sample_count,
@@ -627,7 +676,6 @@ impl BladeRenderer {
         self.gpu.destroy_sampler(self.atlas_sampler);
         self.instance_belt.destroy(&self.gpu);
         self.gpu.destroy_command_encoder(&mut self.command_encoder);
-        self.pipelines.destroy(&self.gpu);
         self.gpu.destroy_surface(&mut self.surface);
         self.gpu.destroy_texture(self.path_intermediate_texture);
         self.gpu

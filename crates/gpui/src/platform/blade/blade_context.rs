@@ -1,3 +1,4 @@
+use super::blade_renderer::BladePipelineCache;
 use anyhow::Context as _;
 use blade_graphics as gpu;
 use std::sync::Arc;
@@ -6,6 +7,8 @@ use util::ResultExt;
 #[cfg_attr(target_os = "macos", derive(Clone))]
 pub struct BladeContext {
     pub(super) gpu: Arc<gpu::Context>,
+    /// The render pipelines every window on this context draws with.
+    pub(super) pipelines: Arc<BladePipelineCache>,
 }
 
 impl BladeContext {
@@ -36,7 +39,10 @@ impl BladeContext {
             }
             .map_err(|e| anyhow::anyhow!("{e:?}"))?,
         );
-        Ok(Self { gpu })
+        Ok(Self {
+            gpu,
+            pipelines: Arc::default(),
+        })
     }
 }
 
