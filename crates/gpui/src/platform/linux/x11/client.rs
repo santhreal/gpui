@@ -411,6 +411,15 @@ pub(crate) struct X11Client(Rc<RefCell<X11ClientState>>);
 
 impl X11Client {
     pub(crate) fn new() -> anyhow::Result<Self> {
+        // The GPU context takes longer than the rest of the client's setup
+        // together: its driver loads and its device is created in 14 ms on
+        // radv and 150 ms on NVIDIA. It is created on a thread of its own
+        // while this one loads the system fonts and sets up the X
+        // connection, and joined when the client is complete.
+        let gpu_context = std::thread::Builder::new()
+            .name("gpu-context".into())
+            .spawn(|| BladeContext::new(Some(blade_graphics::WindowSystem::Xcb)))
+            .context("Failed to start the GPU context thread")?;
         let event_loop = EventLoop::try_new()?;
 
         let (common, main_receiver) = LinuxCommon::new(event_loop.get_signal());
@@ -513,9 +522,6 @@ impl X11Client {
             .to_string();
         let keyboard_layout = LinuxKeyboardLayout::new(layout_name.into());
 
-        let gpu_context = BladeContext::new(Some(blade_graphics::WindowSystem::Xcb))
-            .context("Unable to init GPU context")?;
-
         let resource_database = x11rb::resource_manager::new_from_default(&xcb_connection)
             .context("Failed to create resource database")?;
         let scale_factor = get_scale_factor(&xcb_connection, &resource_database, x_root_index);
@@ -572,6 +578,11 @@ impl X11Client {
             .map_err(|err| anyhow!("Failed to initialize XDP event source: {err:?}"))?;
 
         xcb_flush(&xcb_connection);
+
+        let gpu_context = gpu_context
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .context("Unable to init GPU context")?;
 
         Ok(X11Client(Rc::new(RefCell::new(X11ClientState {
             modifiers: Modifiers::default(),
