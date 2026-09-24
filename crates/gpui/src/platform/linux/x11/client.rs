@@ -411,11 +411,20 @@ pub(crate) struct X11Client(Rc<RefCell<X11ClientState>>);
 
 impl X11Client {
     pub(crate) fn new() -> anyhow::Result<Self> {
+        // The X connection is set up before the GPU context thread starts.
+        // Mesa's device select layer opens and closes an X connection of
+        // its own as the Vulkan instance enumerates devices. An X server
+        // started without -noreset resets when its last client
+        // disconnects, and the reset closes every connection still in
+        // setup: on a server with no other client, as a fresh Xvfb is, a
+        // connection set up beside the layer's fails with "Unknown
+        // connection error".
+        let (xcb_connection, x_root_index) = XCBConnection::connect(None)?;
         // The GPU context takes longer than the rest of the client's setup
         // together: its driver loads and its device is created in 14 ms on
         // radv and 150 ms on NVIDIA. It is created on a thread of its own
-        // while this one loads the system fonts and sets up the X
-        // connection, and joined when the client is complete.
+        // while this one loads the system fonts and queries the X server,
+        // and joined when the client is complete.
         let gpu_context = std::thread::Builder::new()
             .name("gpu-context".into())
             .spawn(|| BladeContext::new(Some(blade_graphics::WindowSystem::Xcb)))
@@ -444,7 +453,6 @@ impl X11Client {
                 anyhow!("Failed to initialize event loop handling of foreground tasks: {err:?}")
             })?;
 
-        let (xcb_connection, x_root_index) = XCBConnection::connect(None)?;
         xcb_connection.prefetch_extension_information(xkb::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(randr::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(render::X11_EXTENSION_NAME)?;
