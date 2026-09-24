@@ -492,6 +492,12 @@ impl WaylandClient {
             }
         });
 
+        // Before LinuxCommon::new starts the dispatcher's threads: blade
+        // creates the Vulkan instance with DISPLAY hidden from the drivers
+        // only while the process has one thread.
+        let gpu_context = BladeContext::new(Some(blade_graphics::WindowSystem::Wayland))
+            .expect("Unable to init GPU context");
+
         let event_loop = EventLoop::<WaylandClientStatePtr>::try_new().unwrap();
 
         let (common, main_receiver) = LinuxCommon::new(event_loop.get_signal());
@@ -509,9 +515,6 @@ impl WaylandClient {
                 }
             })
             .unwrap();
-
-        let gpu_context = BladeContext::new(Some(blade_graphics::WindowSystem::Wayland))
-            .expect("Unable to init GPU context");
 
         let seat = seat.unwrap();
         let globals = Globals::new(

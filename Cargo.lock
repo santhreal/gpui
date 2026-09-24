@@ -2167,7 +2167,7 @@ dependencies = [
 [[package]]
 name = "blade-graphics"
 version = "0.7.1"
-source = "git+https://github.com/santhreal/blade.git?rev=b226e20cdd#b226e20cdddf490f44269d6400c12619b03979e2"
+source = "git+https://github.com/santhreal/blade.git?rev=fe729db003#fe729db00373af7cb440a5e7e49e94233ddb4fc1"
 dependencies = [
  "ash",
  "ash-window",
