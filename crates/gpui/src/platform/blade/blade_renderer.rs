@@ -169,53 +169,36 @@ impl BladePipelines {
             gpu::AlphaMode::PreMultiplied => gpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             gpu::AlphaMode::PostMultiplied => gpu::BlendState::ALPHA_BLENDING,
         };
-        let color_targets = &[gpu::ColorTargetState {
+        let target = |blend| gpu::ColorTargetState {
             format: surface_info.format,
-            blend: Some(blend_mode),
+            blend: Some(blend),
             write_mask: gpu::ColorWrites::default(),
-        }];
-
-        Self {
-            gpu: Arc::clone(gpu),
-            quads: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+        };
+        let specs = [
+            PipelineSpec {
                 name: "quads",
-                data_layouts: &[&ShaderQuadsData::layout()],
-                vertex: shader.at("vs_quad"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_quad")),
-                color_targets,
-                multisample_state: gpu::MultisampleState::default(),
-            }),
-            shadows: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                layout: ShaderQuadsData::layout(),
+                vertex: "vs_quad",
+                fragment: "fs_quad",
+                topology: gpu::PrimitiveTopology::TriangleStrip,
+                color_target: target(blend_mode),
+                sample_count: 1,
+            },
+            PipelineSpec {
                 name: "shadows",
-                data_layouts: &[&ShaderShadowsData::layout()],
-                vertex: shader.at("vs_shadow"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_shadow")),
-                color_targets,
-                multisample_state: gpu::MultisampleState::default(),
-            }),
-            path_rasterization: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                layout: ShaderShadowsData::layout(),
+                vertex: "vs_shadow",
+                fragment: "fs_shadow",
+                topology: gpu::PrimitiveTopology::TriangleStrip,
+                color_target: target(blend_mode),
+                sample_count: 1,
+            },
+            PipelineSpec {
                 name: "path_rasterization",
-                data_layouts: &[&ShaderPathRasterizationData::layout()],
-                vertex: shader.at("vs_path_rasterization"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_path_rasterization")),
+                layout: ShaderPathRasterizationData::layout(),
+                vertex: "vs_path_rasterization",
+                fragment: "fs_path_rasterization",
+                topology: gpu::PrimitiveTopology::TriangleList,
                 // The original implementation was using ADDITIVE blende mode,
                 // I don't know why
                 // color_targets: &[gpu::ColorTargetState {
@@ -223,95 +206,132 @@ impl BladePipelines {
                 //     blend: Some(gpu::BlendState::ADDITIVE),
                 //     write_mask: gpu::ColorWrites::default(),
                 // }],
-                color_targets: &[gpu::ColorTargetState {
-                    format: surface_info.format,
-                    blend: Some(gpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: gpu::ColorWrites::default(),
-                }],
-                multisample_state: gpu::MultisampleState {
-                    sample_count: path_sample_count,
-                    ..Default::default()
-                },
-            }),
-            paths: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                color_target: target(gpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                sample_count: path_sample_count,
+            },
+            PipelineSpec {
                 name: "paths",
-                data_layouts: &[&ShaderPathsData::layout()],
-                vertex: shader.at("vs_path"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_path")),
-                color_targets: &[gpu::ColorTargetState {
-                    format: surface_info.format,
-                    blend: Some(gpu::BlendState {
-                        color: gpu::BlendComponent::OVER,
-                        alpha: gpu::BlendComponent::ADDITIVE,
-                    }),
-                    write_mask: gpu::ColorWrites::default(),
-                }],
-                multisample_state: gpu::MultisampleState::default(),
-            }),
-            underlines: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                layout: ShaderPathsData::layout(),
+                vertex: "vs_path",
+                fragment: "fs_path",
+                topology: gpu::PrimitiveTopology::TriangleStrip,
+                color_target: target(gpu::BlendState {
+                    color: gpu::BlendComponent::OVER,
+                    alpha: gpu::BlendComponent::ADDITIVE,
+                }),
+                sample_count: 1,
+            },
+            PipelineSpec {
                 name: "underlines",
-                data_layouts: &[&ShaderUnderlinesData::layout()],
-                vertex: shader.at("vs_underline"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_underline")),
-                color_targets,
-                multisample_state: gpu::MultisampleState::default(),
-            }),
-            mono_sprites: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                layout: ShaderUnderlinesData::layout(),
+                vertex: "vs_underline",
+                fragment: "fs_underline",
+                topology: gpu::PrimitiveTopology::TriangleStrip,
+                color_target: target(blend_mode),
+                sample_count: 1,
+            },
+            PipelineSpec {
                 name: "mono-sprites",
-                data_layouts: &[&ShaderMonoSpritesData::layout()],
-                vertex: shader.at("vs_mono_sprite"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_mono_sprite")),
-                color_targets,
-                multisample_state: gpu::MultisampleState::default(),
-            }),
-            poly_sprites: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                layout: ShaderMonoSpritesData::layout(),
+                vertex: "vs_mono_sprite",
+                fragment: "fs_mono_sprite",
+                topology: gpu::PrimitiveTopology::TriangleStrip,
+                color_target: target(blend_mode),
+                sample_count: 1,
+            },
+            PipelineSpec {
                 name: "poly-sprites",
-                data_layouts: &[&ShaderPolySpritesData::layout()],
-                vertex: shader.at("vs_poly_sprite"),
-                vertex_fetches: &[],
-                primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                fragment: Some(shader.at("fs_poly_sprite")),
-                color_targets,
-                multisample_state: gpu::MultisampleState::default(),
-            }),
-            surfaces: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                layout: ShaderPolySpritesData::layout(),
+                vertex: "vs_poly_sprite",
+                fragment: "fs_poly_sprite",
+                topology: gpu::PrimitiveTopology::TriangleStrip,
+                color_target: target(blend_mode),
+                sample_count: 1,
+            },
+            PipelineSpec {
                 name: "surfaces",
-                data_layouts: &[&ShaderSurfacesData::layout()],
-                vertex: shader.at("vs_surface"),
+                layout: ShaderSurfacesData::layout(),
+                vertex: "vs_surface",
+                fragment: "fs_surface",
+                topology: gpu::PrimitiveTopology::TriangleStrip,
+                color_target: target(blend_mode),
+                sample_count: 1,
+            },
+        ];
+
+        let build = |spec: &PipelineSpec| {
+            gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: spec.name,
+                data_layouts: &[&spec.layout],
+                vertex: shader.at(spec.vertex),
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
-                    topology: gpu::PrimitiveTopology::TriangleStrip,
+                    topology: spec.topology,
                     ..Default::default()
                 },
                 depth_stencil: None,
-                fragment: Some(shader.at("fs_surface")),
-                color_targets,
-                multisample_state: gpu::MultisampleState::default(),
-            }),
+                fragment: Some(shader.at(spec.fragment)),
+                color_targets: std::slice::from_ref(&spec.color_target),
+                multisample_state: gpu::MultisampleState {
+                    sample_count: spec.sample_count,
+                    ..Default::default()
+                },
+            })
+        };
+        // A pipeline's build translates its two stages to SPIR-V and
+        // compiles them in the driver, tens of milliseconds for the set
+        // when the driver's shader cache is cold. The builds share
+        // nothing, and Vulkan creates pipelines from several threads at
+        // once, so each runs on a thread of its own.
+        let pipelines = std::thread::scope(|scope| {
+            let threads = specs.each_ref().map(|spec| {
+                std::thread::Builder::new()
+                    .name("gpu-pipeline".into())
+                    .spawn_scoped(scope, || build(spec))
+                    .ok()
+            });
+            let mut threads = threads.into_iter();
+            specs.each_ref().map(|spec| match threads.next().flatten() {
+                Some(thread) => thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                // No thread to spare: this one builds it.
+                None => build(spec),
+            })
+        });
+        let [
+            quads,
+            shadows,
+            path_rasterization,
+            paths,
+            underlines,
+            mono_sprites,
+            poly_sprites,
+            surfaces,
+        ] = pipelines;
+        Self {
+            gpu: Arc::clone(gpu),
+            quads,
+            shadows,
+            path_rasterization,
+            paths,
+            underlines,
+            mono_sprites,
+            poly_sprites,
+            surfaces,
         }
     }
+}
+
+/// One pipeline of a [`BladePipelines`] set.
+struct PipelineSpec {
+    name: &'static str,
+    layout: gpu::ShaderDataLayout,
+    vertex: &'static str,
+    fragment: &'static str,
+    topology: gpu::PrimitiveTopology,
+    color_target: gpu::ColorTargetState,
+    sample_count: u32,
 }
 
 impl Drop for BladePipelines {
