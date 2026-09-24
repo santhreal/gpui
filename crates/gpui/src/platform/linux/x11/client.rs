@@ -298,7 +298,6 @@ pub struct X11ClientState {
     xkb_context: xkbc::Context,
     pub(crate) xcb_connection: Rc<XCBConnection>,
     xkb_device_id: i32,
-    client_side_decorations_supported: bool,
     /// A compositing manager ran on the screen at startup: alpha in a
     /// window's pixels blends with what is below it.
     compositor_present: bool,
@@ -464,18 +463,7 @@ impl X11Client {
 
         let root = xcb_connection.setup().roots[x_root_index].root;
         let compositor_present = check_compositor_present(&xcb_connection, x_root_index, root);
-        let gtk_frame_extents_supported =
-            check_gtk_frame_extents_supported(&xcb_connection, &atoms, root);
-        // A window manager that handles _GTK_FRAME_EXTENTS handles windows
-        // that draw their own frame. A compositor decides only whether
-        // their transparent pixels blend, which a frame from the window
-        // manager would not change.
-        let client_side_decorations_supported = gtk_frame_extents_supported;
-        log::info!(
-            "x11: compositor present: {}, gtk_frame_extents_supported: {}",
-            compositor_present,
-            gtk_frame_extents_supported
-        );
+        log::info!("x11: compositor present: {}", compositor_present);
 
         let xkb = get_reply(
             || "Failed to initialize XKB extension",
@@ -603,7 +591,6 @@ impl X11Client {
             xkb_context,
             xcb_connection,
             xkb_device_id,
-            client_side_decorations_supported,
             compositor_present,
             x_root_index,
             _resource_database: resource_database,
@@ -1601,7 +1588,6 @@ impl LinuxClient for X11Client {
             &state.gpu_context,
             params,
             &state.xcb_connection,
-            state.client_side_decorations_supported,
             state.compositor_present,
             state.x_root_index,
             x_window,
@@ -2028,35 +2014,6 @@ fn check_compositor_present(xcb_connection: &XCBConnection, screen: usize, root:
 
     log::debug!("Compositor detection: _NET_WM_CM_S{screen}={owned}, {atom_name}={announced}");
     owned || announced
-}
-
-fn check_gtk_frame_extents_supported(
-    xcb_connection: &XCBConnection,
-    atoms: &XcbAtoms,
-    root: xproto::Window,
-) -> bool {
-    let Some(supported_atoms) = get_reply(
-        || "Failed to get _NET_SUPPORTED",
-        xcb_connection.get_property(
-            false,
-            root,
-            atoms._NET_SUPPORTED,
-            xproto::AtomEnum::ATOM,
-            0,
-            1024,
-        ),
-    )
-    .log_with_level(Level::Debug) else {
-        return false;
-    };
-
-    let supported_atom_ids: Vec<u32> = supported_atoms
-        .value
-        .chunks_exact(4)
-        .filter_map(|chunk| chunk.try_into().ok().map(u32::from_ne_bytes))
-        .collect();
-
-    supported_atom_ids.contains(&atoms._GTK_FRAME_EXTENTS)
 }
 
 fn xdnd_is_atom_supported(atom: u32, atoms: &XcbAtoms) -> bool {

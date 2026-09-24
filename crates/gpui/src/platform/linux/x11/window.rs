@@ -295,7 +295,6 @@ pub struct X11WindowState {
     active: bool,
     hovered: bool,
     fullscreen: bool,
-    client_side_decorations_supported: bool,
     decorations: WindowDecorations,
     /// A `WindowKind::PopUp`: never framed by the window manager.
     popup: bool,
@@ -440,7 +439,6 @@ impl X11WindowState {
         gpu_context: &BladeContext,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
-        client_side_decorations_supported: bool,
         compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
@@ -513,11 +511,6 @@ impl X11WindowState {
         }
 
         let popup = params.kind == WindowKind::PopUp;
-        // A pop-up opens where its owner puts it. Any other window opens
-        // 2px right of its request, as part of the workaround below for
-        // content drawn outside the bounds at a window manager's default
-        // position.
-        let create_x = bounds.origin.x.0 + if popup { 0 } else { 2 };
 
         check_reply(
             || {
@@ -526,7 +519,7 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    create_x,
+                    bounds.origin.x.0,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
@@ -536,7 +529,7 @@ impl X11WindowState {
                 visual.depth,
                 x_window,
                 visual_set.root,
-                create_x as i16,
+                bounds.origin.x.0 as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -568,48 +561,27 @@ impl X11WindowState {
                     (size.height.0 * scale_factor).round() as i32,
                 )
             });
-            if min_size.is_some() || popup {
-                let mut size_hints = WmSizeHints::new();
-                size_hints.min_size = min_size;
-                if popup {
-                    // Flagged user-specified: a window manager maps the
-                    // pop-up where its owner put it instead of applying its
-                    // own placement, which only a later move would undo.
-                    size_hints.position = Some((
-                        WmSizeHintsSpecification::UserSpecified,
-                        bounds.origin.x.0,
-                        bounds.origin.y.0,
-                    ));
-                }
-                check_reply(
-                    || {
-                        format!(
-                            "X11 change of WM_SIZE_HINTS failed. min_size: {:?}",
-                            min_size
-                        )
-                    },
-                    size_hints.set_normal_hints(xcb, x_window),
-                )?;
-            }
-
-            if !popup {
-                let reply = get_reply(|| "X11 GetGeometry failed.", xcb.get_geometry(x_window))?;
-                if reply.x == 0 && reply.y == 0 {
-                    bounds.origin.x.0 += 2;
-                    // Work around a bug where our rendered content appears
-                    // outside the window bounds when opened at the default position
-                    // (14px, 49px on X + Gnome + Ubuntu 22).
-                    let x = bounds.origin.x.0;
-                    let y = bounds.origin.y.0;
-                    check_reply(
-                        || format!("X11 ConfigureWindow failed. x: {}, y: {}", x, y),
-                        xcb.configure_window(
-                            x_window,
-                            &xproto::ConfigureWindowAux::new().x(x).y(y),
-                        ),
-                    )?;
-                }
-            }
+            let mut size_hints = WmSizeHints::new();
+            size_hints.min_size = min_size;
+            // A window manager maps a window with a position hint where the
+            // hint puts it instead of applying its own placement, which only
+            // a move after the map would undo. A pop-up's position is its
+            // owner's; any other window's is the application's.
+            let placed_by = if popup {
+                WmSizeHintsSpecification::UserSpecified
+            } else {
+                WmSizeHintsSpecification::ProgramSpecified
+            };
+            size_hints.position = Some((placed_by, bounds.origin.x.0, bounds.origin.y.0));
+            check_reply(
+                || {
+                    format!(
+                        "X11 change of WM_SIZE_HINTS failed. min_size: {:?}",
+                        min_size
+                    )
+                },
+                size_hints.set_normal_hints(xcb, x_window),
+            )?;
             if let Some(titlebar) = params.titlebar
                 && let Some(title) = titlebar.title
             {
@@ -811,7 +783,6 @@ impl X11WindowState {
                 handle,
                 background_appearance: params.window_background,
                 destroyed: false,
-                client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
                 popup,
                 last_insets: [0, 0, 0, 0],
@@ -908,7 +879,6 @@ impl X11Window {
         gpu_context: &BladeContext,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
-        client_side_decorations_supported: bool,
         compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
@@ -926,7 +896,6 @@ impl X11Window {
                 gpu_context,
                 params,
                 xcb,
-                client_side_decorations_supported,
                 compositor_present,
                 x_main_screen_index,
                 x_window,
@@ -1227,31 +1196,29 @@ impl X11WindowStatePtr {
         bounds.map(|b| b.scale(scale_factor))
     }
 
+    /// Apply a ConfigureNotify. A resize reports the origin relative to the
+    /// window manager's frame, so only its size is read; any other
+    /// configure reports the root position. A configure that changes
+    /// neither, as a window manager sends on a restack or a repeated move
+    /// request, leaves nothing to lay out or draw.
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
         let mut resize_args = None;
-        let is_resize;
+        let mut moved = false;
         {
             let mut state = self.state.borrow_mut();
             let bounds = bounds.map(|f| px(f as f32 / state.scale_factor));
 
-            is_resize = bounds.size.width != state.bounds.size.width
-                || bounds.size.height != state.bounds.size.height;
-
-            // If it's a resize event (only width/height changed), we ignore `bounds.origin`
-            // because it contains wrong values.
-            if is_resize {
+            if bounds.size != state.bounds.size {
                 state.bounds.size = bounds.size;
-            } else {
-                state.bounds = bounds;
-            }
-
-            let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
-            if true {
+                let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
                 state.renderer.update_drawable_size(size(
                     DevicePixels(gpu_size.width as i32),
                     DevicePixels(gpu_size.height as i32),
                 ));
                 resize_args = Some((state.content_size(), state.scale_factor));
+            } else if bounds.origin != state.bounds.origin {
+                state.bounds.origin = bounds.origin;
+                moved = true;
             }
             if let Some(value) = state.last_sync_counter.take() {
                 check_reply(
@@ -1263,12 +1230,12 @@ impl X11WindowStatePtr {
 
         let mut callbacks = self.callbacks.borrow_mut();
         if let Some((content_size, scale_factor)) = resize_args
-            && let Some(ref mut fun) = callbacks.resize
+            && let Some(fun) = &mut callbacks.resize
         {
             fun(content_size, scale_factor)
         }
 
-        if !is_resize && let Some(ref mut fun) = callbacks.moved {
+        if moved && let Some(fun) = &mut callbacks.moved {
             fun();
         }
 
@@ -1768,18 +1735,15 @@ impl PlatformWindow for X11Window {
         let mut state = self.0.state.borrow_mut();
 
         if state.popup {
-            // A pop-up has no frame to fall back to, and its frame hint is
-            // set once, before the map.
+            // A pop-up draws all of itself, and its frame hint is set once,
+            // before the map.
             decorations = crate::WindowDecorations::Client;
         } else {
-            if matches!(decorations, crate::WindowDecorations::Client)
-                && !state.client_side_decorations_supported
-            {
-                log::info!(
-                    "x11: no compositor present, falling back to server-side window decorations"
-                );
-                decorations = crate::WindowDecorations::Server;
-            }
+            // A window that draws its own frame gets none from the window
+            // manager, whether or not the window manager handles
+            // _GTK_FRAME_EXTENTS, which decides only whether shadow insets
+            // stay out of the window's geometry. A new window requests its
+            // decorations before the map, so no frame is ever shown on it.
             let decorated = matches!(decorations, crate::WindowDecorations::Server);
             let set = set_motif_decorations(&self.0.xcb, self.0.x_window, &state.atoms, decorated);
             let Some(()) = set.log_err() else {
