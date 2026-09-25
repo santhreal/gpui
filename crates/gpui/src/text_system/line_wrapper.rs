@@ -864,6 +864,32 @@ mod tests {
         );
     }
 
+    /// A wrapped line never starts with closing punctuation that follows a
+    /// word, and punctuation that opens a word after a space wraps with that
+    /// word. At 72px (9 cells) each case overflows on its last character, so
+    /// the break falls back to the space. Fails when `.`, `"`, `!` or `)`
+    /// stops being a word character.
+    #[test]
+    fn test_wrap_line_keeps_closing_punctuation_attached() {
+        let mut wrapper = build_wrapper();
+
+        for text in ["aaa aaaa.\"", "aaa aaaaa!", "aaa (aaaa)"] {
+            assert_eq!(
+                wrapper
+                    .wrap_line(&[LineFragment::text(text)], px(72.))
+                    .collect::<Vec<_>>(),
+                &[Boundary::new(4, 0)],
+                "{text}"
+            );
+        }
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("aaaa bbb \"cc\"")], px(72.))
+                .collect::<Vec<_>>(),
+            &[Boundary::new(5, 0), Boundary::new(9, 0)],
+        );
+    }
+
     #[test]
     fn test_truncate_line_end() {
         let mut wrapper = build_wrapper();

@@ -1184,6 +1184,28 @@ mod tests {
             .collect()
     }
 
+    /// A shaped line never wraps before closing punctuation that follows a
+    /// word. `aaa aaaa."` in 8px cells overflows 72px on the `"`, so the break
+    /// falls back to the space before `aaaa`, glyph 4. Fails when `.` or `"`
+    /// stops being a word character, which puts a break before the quote.
+    #[test]
+    fn test_wrap_boundaries_keep_closing_punctuation_attached() {
+        let text = "aaa aaaa.\"";
+        let glyphs = (0..text.len())
+            .map(|i| glyph_at(i as f32 * 8., i))
+            .collect::<Vec<_>>();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(80.);
+        let boundaries = layout.compute_wrap_boundaries(text, px(72.), None);
+        assert_eq!(
+            boundaries.as_slice(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 4
+            }]
+        );
+    }
+
     #[test]
     fn test_force_width_latin_unchanged() {
         let cell_width = px(8.);
