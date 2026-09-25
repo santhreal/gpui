@@ -1,3 +1,5 @@
+mod layers;
+
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block::ConcreteBlock;
@@ -12,6 +14,7 @@ use gpui::{
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
+use layers::RenderLayers;
 
 use core_foundation::base::TCFType;
 use core_video::{
@@ -134,6 +137,8 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    /// Offscreen targets and pipelines for backdrop blurs and path clips.
+    layers: RenderLayers,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -352,6 +357,7 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            layers: RenderLayers::new(library),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -660,9 +666,25 @@ impl MetalRenderer {
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
 
+        // A backdrop blur reads the frame drawn so far, so a frame with blurs
+        // draws into an offscreen texture that is copied into `texture` last.
+        let backdrop_targets = if scene.backdrop_blurs.is_empty() {
+            None
+        } else {
+            Some(self.layers.backdrop_targets(&self.device, viewport_size)?)
+        };
+        let frame: &metal::TextureRef = match &backdrop_targets {
+            Some(targets) => &*targets.frame,
+            None => texture,
+        };
+        // Open path clips, innermost last, each with the layer its subtree
+        // draws into.
+        let mut clip_stack: Vec<(Path<ScaledPixels>, metal::Texture)> = Vec::new();
+        let mut used_clip = false;
+
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
-            texture,
+            frame,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
@@ -688,7 +710,7 @@ impl MetalRenderer {
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
-                        texture,
+                        current_target(frame, &clip_stack),
                         viewport_size,
                         None,
                     );
@@ -732,12 +754,122 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    command_encoder.end_encoding();
+                    let targets = backdrop_targets
+                        .as_ref()
+                        .context("backdrop blur batch in a frame without backdrop targets")?;
+                    RenderLayers::snapshot_frame(command_buffer, targets);
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        current_target(frame, &clip_stack),
+                        viewport_size,
+                        None,
+                    );
+                    if let Err(error) = self.layers.draw_backdrop_blurs(
+                        &self.device,
+                        range,
+                        &instance_bindings.backdrop_blurs,
+                        &self.unit_vertices,
+                        &targets.backdrop,
+                        viewport_size,
+                        command_encoder,
+                    ) {
+                        command_encoder.end_encoding();
+                        return Err(error);
+                    }
+                }
+                PrimitiveBatch::StartPathClip(path) => {
+                    command_encoder.end_encoding();
+                    let layer =
+                        self.layers
+                            .clip_layer(&self.device, viewport_size, clip_stack.len())?;
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        &layer,
+                        viewport_size,
+                        Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+                    );
+                    clip_stack.push((path, layer));
+                    used_clip = true;
+                }
+                PrimitiveBatch::EndPathClip => {
+                    command_encoder.end_encoding();
+                    let clip = clip_stack.pop();
+                    // The clip path is rasterized when the clip closes, so
+                    // paths drawn inside the subtree cannot overwrite it.
+                    let did_draw = match &clip {
+                        Some((path, _)) => self.draw_paths_to_intermediate(
+                            slice::from_ref(path),
+                            writer,
+                            viewport_size,
+                            command_buffer,
+                        )?,
+                        None => false,
+                    };
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        current_target(frame, &clip_stack),
+                        viewport_size,
+                        None,
+                    );
+                    if did_draw
+                        && let Some((path, layer)) = &clip
+                        && let Err(error) = self.draw_path_clip_composite(
+                            path,
+                            layer,
+                            writer,
+                            viewport_size,
+                            command_encoder,
+                        )
+                    {
+                        command_encoder.end_encoding();
+                        return Err(error);
+                    }
+                }
             }
         }
 
         command_encoder.end_encoding();
 
+        if let Some(targets) = &backdrop_targets {
+            self.layers.copy_frame(
+                &self.device,
+                command_buffer,
+                &targets.frame,
+                texture,
+                viewport_size,
+            )?;
+        }
+        self.layers.end_frame(backdrop_targets.is_some(), used_clip);
+
         Ok(command_buffer.to_owned())
+    }
+
+    fn draw_path_clip_composite(
+        &mut self,
+        path: &Path<ScaledPixels>,
+        layer: &metal::TextureRef,
+        writer: &mut InstanceBufferWriter,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
+        let mask = self
+            .path_intermediate_texture
+            .as_ref()
+            .context("missing path intermediate texture")?;
+        let sprite = writer.write(&[PathSprite {
+            bounds: path.transformation.apply_to_bounds(path.clipped_bounds()),
+        }])?;
+        self.layers.draw_path_clip_composite(
+            &self.device,
+            &sprite,
+            &self.unit_vertices,
+            layer,
+            mask,
+            viewport_size,
+            command_encoder,
+        )
     }
 
     fn draw_paths_to_intermediate(
@@ -1204,9 +1336,23 @@ impl MetalRenderer {
     }
 }
 
+/// Returns the texture batches draw into: the innermost open clip layer, or
+/// `frame` when no path clip is open.
+fn current_target<'a>(
+    frame: &'a metal::TextureRef,
+    clip_stack: &'a [(Path<ScaledPixels>, metal::Texture)],
+) -> &'a metal::TextureRef {
+    match clip_stack.last() {
+        Some((_, layer)) => &**layer,
+        None => frame,
+    }
+}
+
+/// Begins a render pass on `texture`. The render pass descriptor retains the
+/// texture, so the returned encoder does not borrow it.
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
-    texture: &'a metal::TextureRef,
+    texture: &metal::TextureRef,
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
@@ -1386,6 +1532,7 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
+    backdrop_blurs: InstanceBinding,
 }
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
@@ -1399,6 +1546,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
             bounds: surface.bounds,
             content_mask: surface.content_mask,
         }))?,
+        backdrop_blurs: writer.write(&scene.backdrop_blurs)?,
     })
 }
 
@@ -1577,6 +1725,25 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+}
+
+#[repr(C)]
+enum BackdropBlurInputIndex {
+    Vertices = 0,
+    BackdropBlurs = 1,
+    ViewportSize = 2,
+    Backdrop = 3,
+}
+
+#[repr(C)]
+enum PathClipInputIndex {
+    Layer = 0,
+    Mask = 1,
+}
+
+#[repr(C)]
+enum FrameCopyInputIndex {
+    Frame = 0,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

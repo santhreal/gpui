@@ -788,6 +788,16 @@ impl PrimitiveBatch {
 }
 
 /// Marker primitive opening a path-clipped subtree.
+///
+/// Primitives between a `StartPathClip` and its [`EndPathClip`] draw into a
+/// layer cleared to transparent black. At the `EndPathClip` the layer, which
+/// holds premultiplied color, is composited onto the target beneath it:
+/// `dst.rgb = layer.rgb * m + dst.rgb * (1 - layer.a * m)`, where `m` is the
+/// alpha of `path` rasterized with path antialiasing; destination alpha
+/// combines as it does for path sprites. The path is rasterized when the
+/// clip closes, so paths drawn inside the subtree do not change `m`. Clips
+/// nest: each open clip draws into its own layer. A [`BackdropBlur`] inside a
+/// clip samples the frame beneath every open clip layer.
 #[derive(Clone, Debug)]
 pub struct StartPathClip {
     /// The draw order
@@ -796,11 +806,33 @@ pub struct StartPathClip {
     pub path: Path<ScaledPixels>,
 }
 
-/// Marker primitive closing a path-clipped subtree.
+/// Marker primitive closing a path-clipped subtree. See [`StartPathClip`].
 #[derive(Clone, Copy, Debug)]
 pub struct EndPathClip {
     /// The draw order
     pub order: DrawOrder,
+}
+
+/// Consecutive frames without a backdrop blur (or without a path clip) after
+/// which a renderer releases the offscreen textures that feature uses.
+pub const LAYER_IDLE_RELEASE_FRAMES: u32 = 30;
+
+/// Counts consecutive frames in which a renderer feature went unused.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LayerIdleCounter(u32);
+
+impl LayerIdleCounter {
+    /// Records one finished frame. Returns true when the feature has gone
+    /// unused for [`LAYER_IDLE_RELEASE_FRAMES`] consecutive frames, and on
+    /// every later unused frame. A used frame restarts the count.
+    pub fn tick(&mut self, used: bool) -> bool {
+        if used {
+            self.0 = 0;
+            return false;
+        }
+        self.0 = self.0.saturating_add(1);
+        self.0 >= LAYER_IDLE_RELEASE_FRAMES
+    }
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -867,6 +899,32 @@ impl From<Shadow> for Primitive {
     }
 }
 
+/// A region that shows the frame drawn before it, blurred, saturated, and
+/// tinted.
+///
+/// `bounds` and `corner_radii` give the body shape before `transformation`,
+/// `content_mask` the rounded clip in window space, `blur_radius` the sampling
+/// radius in device pixels, `saturation` the saturation factor (1 leaves
+/// colors unchanged), and `tint` the color mixed over the result by its alpha.
+///
+/// For a pixel at window position `p`, `B(x)` is the frame drawn before this
+/// primitive (beneath every open path clip layer), sampled with bilinear
+/// filtering and clamped to the frame edge. Every backend computes:
+///
+/// - Blur, with `r = blur_radius`: the weighted mean of `B(p)` with weight 1
+///   and 24 taps `B(p + r * k * (cos t, sin t))` for `i` in `0..8`: ring 1
+///   `k = 0.38`, weight 0.637, `t = i * pi / 4`; ring 2 `k = 0.70`, weight
+///   0.216, `t = (i + 0.5) * pi / 4`; ring 3 `k = 1.00`, weight 0.044,
+///   `t = i * pi / 4`. When `r <= 0` the result is `B(p)`.
+/// - Saturation: `L = dot(rgb, (0.2126, 0.7152, 0.0722))` and
+///   `rgb' = clamp(L + saturation * (rgb - L), 0, 1)`.
+/// - Tint: `rgb'' = mix(rgb', tint.rgb, tint.a)`, with `tint` in RGBA.
+/// - Coverage: `saturate(0.5 - sdf(q, bounds, corner_radii)) *
+///   saturate(0.5 - sdf(p, content_mask.bounds, content_mask.corner_radii))`,
+///   where `q` is `p` before `transformation` and `sdf` is the rounded
+///   rectangle signed distance that quads use.
+/// - Output: color `rgb''` with alpha `a * coverage`, where `a` is the alpha
+///   of the blurred color, blended source-over onto the target.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -1676,5 +1734,23 @@ mod tests {
             }
             other => panic!("unexpected batches: {:?}", other),
         }
+    }
+
+    /// A renderer releases a feature's textures once the feature has been
+    /// unused for `LAYER_IDLE_RELEASE_FRAMES` consecutive frames, and any use
+    /// restarts the count. Catches an off-by-one threshold, a count that
+    /// ignores use, and a counter that stops reporting after the first release.
+    #[test]
+    fn layer_idle_counter_releases_after_consecutive_unused_frames() {
+        let mut counter = LayerIdleCounter::default();
+        for _ in 1..LAYER_IDLE_RELEASE_FRAMES {
+            assert!(!counter.tick(false));
+        }
+        assert!(!counter.tick(true));
+        for _ in 1..LAYER_IDLE_RELEASE_FRAMES {
+            assert!(!counter.tick(false));
+        }
+        assert!(counter.tick(false));
+        assert!(counter.tick(false));
     }
 }

@@ -899,6 +899,132 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  uint blur_id [[flat]];
+  float2 local_position;
+  float2 window_position;
+  float4 tint [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+  uint blur_id [[flat]];
+  float2 local_position;
+  float2 window_position;
+  float4 tint [[flat]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_BackdropBlurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlur blur = blurs[blur_id];
+  float2 local_position =
+      unit_vertex * float2(blur.bounds.size.width, blur.bounds.size.height) +
+      float2(blur.bounds.origin.x, blur.bounds.origin.y);
+  float2 window_position = float2(
+      local_position.x * blur.transformation.rotation_scale[0][0] +
+          local_position.y * blur.transformation.rotation_scale[0][1] +
+          blur.transformation.translation[0],
+      local_position.x * blur.transformation.rotation_scale[1][0] +
+          local_position.y * blur.transformation.rotation_scale[1][1] +
+          blur.transformation.translation[1]);
+  float2 viewport = float2((float)viewport_size->width, (float)viewport_size->height);
+  float4 device_position =
+      float4(window_position / viewport * float2(2., -2.) + float2(-1., 1.), 0., 1.);
+  Bounds_ScaledPixels clip = blur.content_mask.bounds;
+  return BackdropBlurVertexOutput{
+      device_position,
+      blur_id,
+      local_position,
+      window_position,
+      hsla_to_rgba(blur.tint),
+      {window_position.x - clip.origin.x,
+       clip.origin.x + clip.size.width - window_position.x,
+       window_position.y - clip.origin.y,
+       clip.origin.y + clip.size.height - window_position.y}};
+}
+
+// Implements the kernel documented on `BackdropBlur` in gpui's scene.rs.
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_BackdropBlurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]],
+    texture2d<float> backdrop [[texture(BackdropBlurInputIndex_Backdrop)]]) {
+  BackdropBlur blur = blurs[input.blur_id];
+  float mask_distance = quad_sdf(input.window_position, blur.content_mask.bounds,
+                                 blur.content_mask.corner_radii);
+  float distance = quad_sdf(input.local_position, blur.bounds, blur.corner_radii);
+  float coverage = saturate(0.5 - distance) * saturate(0.5 - mask_distance);
+  if (coverage <= 0.0) {
+    return float4(0.0);
+  }
+
+  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear,
+                                     address::clamp_to_edge);
+  float2 viewport = float2((float)viewport_size->width, (float)viewport_size->height);
+  float2 uv = input.position.xy / viewport;
+  float4 color = backdrop.sample(backdrop_sampler, uv);
+  float radius = blur.blur_radius;
+  if (radius > 0.0) {
+    const float ring_radii[3] = {0.38f, 0.70f, 1.00f};
+    const float ring_weights[3] = {0.637f, 0.216f, 0.044f};
+    const float ring_phases[3] = {0.0f, 0.5f, 0.0f};
+    float2 texel = float2(radius) / viewport;
+    float4 sum = color;
+    float weight = 1.0;
+    for (uint ring = 0; ring < 3; ring++) {
+      for (uint i = 0; i < 8; i++) {
+        float theta = (float(i) + ring_phases[ring]) * (M_PI_F / 4.0);
+        float2 offset = float2(cos(theta), sin(theta)) * ring_radii[ring] * texel;
+        sum += backdrop.sample(backdrop_sampler, uv + offset) * ring_weights[ring];
+        weight += ring_weights[ring];
+      }
+    }
+    color = sum / weight;
+  }
+
+  float luminance = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+  float3 saturated =
+      saturate(float3(luminance) + blur.saturation * (color.rgb - float3(luminance)));
+  float3 tinted = mix(saturated, input.tint.rgb, input.tint.a);
+  return float4(tinted, color.a * coverage);
+}
+
+// Composites a path-clipped layer onto its parent target, scaled by the
+// coverage of the clip path rasterized into the path intermediate texture.
+fragment float4 path_clip_composite_fragment(
+    PathSpriteVertexOutput input [[stage_in]],
+    texture2d<float> layer [[texture(PathClipInputIndex_Layer)]],
+    texture2d<float> mask [[texture(PathClipInputIndex_Mask)]]) {
+  constexpr sampler layer_sampler(mag_filter::linear, min_filter::linear);
+  float coverage = mask.sample(layer_sampler, input.texture_coords).a;
+  return layer.sample(layer_sampler, input.texture_coords) * coverage;
+}
+
+struct FrameCopyVertexOutput {
+  float4 position [[position]];
+};
+
+// One triangle covering the whole target.
+vertex FrameCopyVertexOutput frame_copy_vertex(uint vertex_id [[vertex_id]]) {
+  float2 corner = float2(float((vertex_id << 1) & 2), float(vertex_id & 2));
+  return FrameCopyVertexOutput{
+      float4(corner * float2(2., -2.) + float2(-1., 1.), 0., 1.)};
+}
+
+fragment float4 frame_copy_fragment(
+    FrameCopyVertexOutput input [[stage_in]],
+    texture2d<float> frame [[texture(FrameCopyInputIndex_Frame)]]) {
+  return frame.read(uint2(input.position.xy));
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;

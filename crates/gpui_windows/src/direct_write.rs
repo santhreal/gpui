@@ -1361,12 +1361,12 @@ impl GlyphLayerTexture {
 }
 
 #[repr(C)]
-struct GlyphLayerTextureParams {
-    bounds: Bounds<i32>,
-    run_color: Rgba,
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
-    _pad: [f32; 3],
+pub(crate) struct GlyphLayerTextureParams {
+    pub(crate) bounds: Bounds<i32>,
+    pub(crate) run_color: Rgba,
+    pub(crate) gamma_ratios: [f32; 4],
+    pub(crate) grayscale_enhanced_contrast: f32,
+    pub(crate) _pad: [f32; 3],
 }
 
 struct TextRendererWrapper(IDWriteTextRenderer);

@@ -1,3 +1,9 @@
+#[cfg(test)]
+mod draw_tests;
+mod layers;
+#[cfg(all(test, debug_assertions))]
+mod shader_layout_tests;
+
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -22,6 +28,7 @@ use windows::{
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
 use gpui::*;
+use layers::RenderLayers;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -44,6 +51,8 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    /// Offscreen textures and pipelines for backdrop blurs and path clips.
+    layers: RenderLayers,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -190,6 +199,7 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            layers: RenderLayers::default(),
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -272,6 +282,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.layers = RenderLayers::default();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -362,6 +373,10 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+        // Open path clips, innermost last. Batches draw into the layer of the
+        // innermost clip, or into the render target when none is open.
+        let mut clip_stack: Vec<Path<ScaledPixels>> = Vec::new();
+        let mut used_clip = false;
         for batch in scene.batches() {
             let _annotation = annotation
                 .as_ref()
@@ -370,9 +385,7 @@ impl DirectXRenderer {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
+                    self.draw_paths(&scene.paths[range], clip_stack.len())
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -385,11 +398,19 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    self.draw_backdrop_blurs(range.start, range.len())
+                }
+                PrimitiveBatch::StartPathClip(path) => {
+                    used_clip = true;
+                    self.begin_path_clip(path, &mut clip_stack)
+                }
+                PrimitiveBatch::EndPathClip => self.end_path_clip(&mut clip_stack),
             }
             .with_context(|| {
                 format!(
                     "scene too large:\
-                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces, {} backdrop blurs",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
@@ -398,9 +419,12 @@ impl DirectXRenderer {
                     scene.subpixel_sprites.len(),
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),
+                    scene.backdrop_blurs.len(),
                 )
             })?;
         }
+        self.layers
+            .end_frame(!scene.backdrop_blurs.is_empty(), used_clip);
         Ok(())
     }
 
@@ -577,6 +601,14 @@ impl DirectXRenderer {
             )?;
         }
 
+        if !scene.backdrop_blurs.is_empty() {
+            self.layers.upload_backdrop_blurs(
+                &devices.device,
+                &devices.device_context,
+                &scene.backdrop_blurs,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -612,9 +644,12 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    /// Rasterizes `paths` into the path intermediate texture, which leaves
+    /// the intermediate MSAA texture bound as the render target. Returns
+    /// whether anything was drawn.
+    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<bool> {
         if paths.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -666,13 +701,9 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore main render target
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -716,6 +747,103 @@ impl DirectXRenderer {
             slice::from_ref(&resources.path_intermediate_srv),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
+        )
+    }
+
+    /// Draws a batch of paths into the target of clip nesting `clip_depth`.
+    fn draw_paths(&mut self, paths: &[Path<ScaledPixels>], clip_depth: usize) -> Result<()> {
+        if self.draw_paths_to_intermediate(paths)? {
+            self.bind_target(clip_depth)?;
+            self.draw_paths_from_intermediate(paths)?;
+        }
+        Ok(())
+    }
+
+    /// Binds the render target that batches at clip nesting `clip_depth`
+    /// draw into: the layer of the innermost open clip, or the frame when no
+    /// clip is open.
+    fn bind_target(&self, clip_depth: usize) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let view = match clip_depth.checked_sub(1) {
+            None => {
+                &self
+                    .resources
+                    .as_ref()
+                    .context("resources missing")?
+                    .render_target_view
+            }
+            Some(depth) => self.layers.clip_layer_view(depth)?,
+        };
+        unsafe {
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(view)), None)
+        };
+        Ok(())
+    }
+
+    fn draw_backdrop_blurs(&mut self, start: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let frame = self
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.render_target.as_ref())
+            .context("render target missing")?;
+        self.layers.draw_backdrop_blurs(
+            &devices.device,
+            &devices.device_context,
+            frame,
+            (self.width, self.height),
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            start as u32,
+            len as u32,
+        )
+    }
+
+    /// Opens a path clip: later batches draw into a cleared layer until the
+    /// matching [`end_path_clip`](Self::end_path_clip).
+    fn begin_path_clip(
+        &mut self,
+        path: Path<ScaledPixels>,
+        clip_stack: &mut Vec<Path<ScaledPixels>>,
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.layers.begin_clip_layer(
+            &devices.device,
+            &devices.device_context,
+            (self.width, self.height),
+            clip_stack.len(),
+        )?;
+        clip_stack.push(path);
+        self.bind_target(clip_stack.len())
+    }
+
+    /// Closes the innermost path clip: rasterizes its path, then composites
+    /// its layer onto the parent target scaled by the path's coverage.
+    fn end_path_clip(&mut self, clip_stack: &mut Vec<Path<ScaledPixels>>) -> Result<()> {
+        let path = clip_stack
+            .pop()
+            .context("path clip end without a matching start")?;
+        // The clip path is rasterized when the clip closes, so paths drawn
+        // inside the subtree cannot overwrite it.
+        self.draw_paths_to_intermediate(slice::from_ref(&path))?;
+        self.bind_target(clip_stack.len())?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        self.layers.draw_path_clip_composite(
+            &devices.device,
+            &devices.device_context,
+            PathSprite {
+                bounds: path.transformation.apply_to_bounds(path.clipped_bounds()),
+            },
+            clip_stack.len(),
+            &resources.path_intermediate_srv,
         )
     }
 
@@ -1711,6 +1839,8 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        BackdropBlur,
+        PathClipComposite,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1787,6 +1917,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlur => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_FRAGMENT_BYTES,
+                },
+                ShaderModule::PathClipComposite => match target {
+                    ShaderTarget::Vertex => PATH_CLIP_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PATH_CLIP_COMPOSITE_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1875,6 +2013,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::BackdropBlur => "backdrop_blur",
+                ShaderModule::PathClipComposite => "path_clip_composite",
             }
         }
     }
