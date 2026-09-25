@@ -138,6 +138,19 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.open_scope(bounds);
+        self.paint_operations
+            .push(PaintOperation::StartLayer(bounds));
+    }
+
+    pub fn pop_layer(&mut self) {
+        self.close_scope();
+        self.paint_operations.push(PaintOperation::EndLayer);
+    }
+
+    /// Opens the scope of a layer with `bounds` without recording a paint
+    /// operation, for the callers whose own operation reopens it on replay.
+    fn open_scope(&mut self, bounds: Bounds<ScaledPixels>) {
         let prefix = self.key_for(bounds);
         let tree = self.scopes.len();
         if self.bounds_trees.len() <= tree {
@@ -150,17 +163,14 @@ impl Scene {
             z_index: 0,
             tree,
         });
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
     }
 
-    pub fn pop_layer(&mut self) {
-        // The root scope is never popped: a layer is only ever popped by the
-        // `with_content_mask` that pushed it, so a second scope exists here.
+    fn close_scope(&mut self) {
+        // The root scope is never closed: a scope is only ever closed by the
+        // caller that opened it, so a second scope exists here.
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
-        self.paint_operations.push(PaintOperation::EndLayer);
     }
 
     /// Sorts primitives inserted until the matching `pop_z_index` at `z_index`
@@ -185,8 +195,8 @@ impl Scene {
     /// Start a path-clipped subtree.
     pub fn push_path_clip(&mut self, path: Path<ScaledPixels>) {
         let bounds = path.transformation.apply_to_bounds(path.clipped_bounds());
-        self.push_layer(bounds);
-        let key = self.key_for(bounds);
+        self.open_scope(bounds);
+        let key = self.scope_edge_key(i32::MIN, DrawOrder::MIN);
         let index = self.start_path_clips.len() as u32;
         self.ranks.push(Rank {
             key,
@@ -203,16 +213,7 @@ impl Scene {
 
     /// End the innermost path-clipped subtree.
     pub fn pop_path_clip(&mut self) {
-        let bounds = self
-            .start_path_clips
-            .last()
-            .map(|c| {
-                c.path
-                    .transformation
-                    .apply_to_bounds(c.path.clipped_bounds())
-            })
-            .unwrap_or_default();
-        let key = self.key_for(bounds);
+        let key = self.scope_edge_key(i32::MAX, DrawOrder::MAX);
         let index = self.end_path_clips.len() as u32;
         self.ranks.push(Rank {
             key,
@@ -221,13 +222,23 @@ impl Scene {
         });
         self.end_path_clips.push(EndPathClip { order: 0 });
         self.paint_operations.push(PaintOperation::EndPathClip);
-        self.pop_layer();
+        self.close_scope();
+    }
+
+    /// A key in the current scope that sorts before every child of the
+    /// scope when `(z_index, order)` is the minimum and after every child
+    /// when it is the maximum, whatever the children's z-indices and bounds.
+    fn scope_edge_key(&mut self, z_index: i32, order: DrawOrder) -> SortKey {
+        let mut key = self.scope().prefix.clone();
+        key.push((z_index, order));
+        key
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
-            .bounds()
+            .transformation()
+            .apply_to_bounds(*primitive.bounds())
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -467,6 +478,21 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropBlur(blur) => &blur.content_mask,
+        }
+    }
+
+    /// The transformation from the primitive's `bounds` to window space.
+    pub fn transformation(&self) -> TransformationMatrix {
+        match self {
+            Primitive::Shadow(shadow) => shadow.transformation,
+            Primitive::Quad(quad) => quad.transformation,
+            Primitive::Path(path) => path.transformation,
+            Primitive::Underline(underline) => underline.transformation,
+            Primitive::MonochromeSprite(sprite) => sprite.transformation,
+            Primitive::SubpixelSprite(sprite) => sprite.transformation,
+            Primitive::PolychromeSprite(sprite) => sprite.transformation,
+            Primitive::Surface(_) => TransformationMatrix::unit(),
+            Primitive::BackdropBlur(blur) => blur.transformation,
         }
     }
 }
@@ -1456,6 +1482,12 @@ impl PathVertex<Pixels> {
         }
     }
 }
+
+#[cfg(test)]
+mod transformed_bounds_tests;
+
+#[cfg(test)]
+mod path_clip_tests;
 
 #[cfg(test)]
 mod tests {
