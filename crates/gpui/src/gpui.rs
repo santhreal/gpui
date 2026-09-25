@@ -33,6 +33,7 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
+pub mod motion;
 mod path_builder;
 mod platform;
 pub mod prelude;

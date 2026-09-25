@@ -6,8 +6,11 @@ use anyhow::Result;
 use gpui::{
     Animation, AnimationExt as _, AnimationPhase, App, AssetSource, Bounds, Context, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, SharedString, SpringAnimation, SpringConfig,
-    Transformation, Window, WindowBounds, WindowOptions, bounce, div, ease_in_out, percentage,
-    prelude::*, px, relative, rgba, size, svg,
+    Transformation, Window, WindowBounds, WindowOptions, div,
+    motion::{bounce, ease_in_out},
+    percentage,
+    prelude::*,
+    px, relative, rgba, size, svg,
 };
 use gpui_platform::application;
 

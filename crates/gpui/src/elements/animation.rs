@@ -8,10 +8,9 @@ use std::{
 use crate::{
     AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
     ParentElement, SpringAnimation, SpringConfig, SpringPlayback, SpringState, SpringTarget,
-    Window,
+    Window, motion::linear,
 };
 
-pub use easing::*;
 use smallvec::SmallVec;
 
 /// An animation that can be applied to an element.
@@ -680,62 +679,6 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         // The frame this element requests repaints only what it declares.
         window.declare_damage(bounds);
         element.paint(window, cx);
-    }
-}
-
-mod easing {
-    use std::f32::consts::PI;
-
-    /// The linear easing function, or delta itself
-    pub fn linear(delta: f32) -> f32 {
-        delta
-    }
-
-    /// The quadratic easing function, delta * delta
-    pub fn quadratic(delta: f32) -> f32 {
-        delta * delta
-    }
-
-    /// The quadratic ease-in-out function, which starts and ends slowly but speeds up in the middle
-    pub fn ease_in_out(delta: f32) -> f32 {
-        if delta < 0.5 {
-            2.0 * delta * delta
-        } else {
-            let x = -2.0 * delta + 2.0;
-            1.0 - x * x / 2.0
-        }
-    }
-
-    /// The Quint ease-out function, which starts quickly and decelerates to a stop
-    pub fn ease_out_quint() -> impl Fn(f32) -> f32 {
-        move |delta| 1.0 - (1.0 - delta).powi(5)
-    }
-
-    /// Apply the given easing function, first in the forward direction and then in the reverse direction
-    pub fn bounce(easing: impl Fn(f32) -> f32) -> impl Fn(f32) -> f32 {
-        move |delta| {
-            if delta < 0.5 {
-                easing(delta * 2.0)
-            } else {
-                easing((1.0 - delta) * 2.0)
-            }
-        }
-    }
-
-    /// A custom easing function for pulsating alpha that slows down as it approaches 0.1
-    pub fn pulsating_between(min: f32, max: f32) -> impl Fn(f32) -> f32 {
-        let range = max - min;
-
-        move |delta| {
-            // Use a combination of sine and cubic functions for a more natural breathing rhythm
-            let t = (delta * 2.0 * PI).sin();
-            let breath = (t * t * t + t) / 2.0;
-
-            // Map the breath to our desired alpha range
-            let normalized_alpha = (breath + 1.0) / 2.0;
-
-            min + (normalized_alpha * range)
-        }
     }
 }
 

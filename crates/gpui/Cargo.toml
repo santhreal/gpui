@@ -67,6 +67,7 @@ image.workspace = true
 inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
+motion.workspace = true
 num_cpus = "1.13"
 parking = "2.0.0"
 parking_lot.workspace = true

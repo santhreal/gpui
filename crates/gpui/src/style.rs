@@ -1165,7 +1165,7 @@ pub enum TransitionEasing {
     /// Linear interpolation (constant velocity).
     #[default]
     Linear,
-    /// Standard cubic bezier ease in and out.
+    /// Quadratic ease in and out, the curve of [`Self::EaseInOut`].
     Ease,
     /// Accelerating from zero velocity.
     EaseIn,
@@ -1182,18 +1182,11 @@ impl TransitionEasing {
     pub fn eval(&self, t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
         match self {
-            Self::Linear => t,
-            Self::Ease => crate::ease_in_out(t),
-            Self::EaseIn => t * t,
-            Self::EaseOut => t * (2.0 - t),
-            Self::EaseInOut => crate::ease_in_out(t),
-            Self::Step => {
-                if t < 1.0 {
-                    0.0
-                } else {
-                    1.0
-                }
-            }
+            Self::Linear => crate::motion::linear(t),
+            Self::Ease | Self::EaseInOut => crate::motion::ease_in_out(t),
+            Self::EaseIn => crate::motion::quadratic(t),
+            Self::EaseOut => crate::motion::ease_out_quad(t),
+            Self::Step => crate::motion::Easing::Step.eval(t),
         }
     }
 }
