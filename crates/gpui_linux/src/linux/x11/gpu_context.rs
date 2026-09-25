@@ -23,7 +23,9 @@ use std::{
 };
 
 use anyhow::{Context as _, anyhow};
-use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{
+    CompositorGpuHint, GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu,
+};
 use raw_window_handle as rwh;
 use x11rb::xcb_ffi::XCBConnection;
 
@@ -35,7 +37,11 @@ pub(crate) struct Pending<T: Send + 'static, K> {
 }
 
 impl<T: Send + 'static, K> Pending<T, K> {
-    fn spawn(name: &str, keep: K, body: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<Self> {
+    fn spawn(
+        name: &str,
+        keep: K,
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> anyhow::Result<Self> {
         let thread = std::thread::Builder::new()
             .name(name.into())
             .spawn(body)
@@ -87,8 +93,7 @@ pub(crate) fn spawn(
         screen: i32::try_from(screen).context("X screen number out of range")?,
     };
     Pending::spawn("gpu-context", Rc::clone(connection), move || {
-        let instance = WgpuContext::instance(Box::new(display));
-        WgpuContext::new_surfaceless(instance, compositor_gpu)
+        WgpuContext::for_display(&display, compositor_gpu)
     })
 }
 

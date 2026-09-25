@@ -52,7 +52,8 @@ fn a_dropped_pending_result_ends_its_thread_before_it_releases_what_the_thread_r
 #[test]
 fn a_joined_pending_result_is_the_value_of_its_thread_and_continues_its_panic() {
     assert_eq!(Pending::spawn("test", (), || 7).unwrap().join(), 7);
-    let panicking = Pending::spawn("test", (), || -> u32 { panic!("the driver panicked") }).unwrap();
+    let panicking =
+        Pending::spawn("test", (), || -> u32 { panic!("the driver panicked") }).unwrap();
     let joined = catch_unwind(AssertUnwindSafe(|| panicking.join()));
     let panic = joined.expect_err("the join returned instead of continuing the panic");
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"the driver panicked"));
@@ -74,8 +75,16 @@ fn a_window_adopts_the_threads_context_only_if_its_renderer_reported_no_error() 
     let reported = validation_error().to_string();
     for (renderer, validation, expected) in [
         (Ok(1), Some(validation_error()), reported.as_str()),
-        (Err(anyhow!("incompatible surface")), None, "incompatible surface"),
-        (Err(anyhow!("incompatible surface")), Some(validation_error()), reported.as_str()),
+        (
+            Err(anyhow!("incompatible surface")),
+            None,
+            "incompatible surface",
+        ),
+        (
+            Err(anyhow!("incompatible surface")),
+            Some(validation_error()),
+            reported.as_str(),
+        ),
     ] {
         let error = adopted(renderer, validation).expect_err("an unchecked context was adopted");
         assert_eq!(error.to_string(), expected);

@@ -1,3 +1,7 @@
+mod pipelines;
+
+#[cfg(not(target_family = "wasm"))]
+use crate::wgpu_context::create_surface;
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -6,6 +10,7 @@ use gpui::{
     PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix, get_gamma_correction_ratios,
 };
 use log::warn;
+use pipelines::{WgpuPipelines, WgpuShaders};
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
@@ -138,26 +143,6 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
-struct WgpuPipelines {
-    quads: wgpu::RenderPipeline,
-    shadows: wgpu::RenderPipeline,
-    path_rasterization: wgpu::RenderPipeline,
-    paths: wgpu::RenderPipeline,
-    underlines: wgpu::RenderPipeline,
-    mono_sprites: wgpu::RenderPipeline,
-    subpixel_sprites: Option<wgpu::RenderPipeline>,
-    poly_sprites: wgpu::RenderPipeline,
-    #[allow(dead_code)]
-    surfaces: wgpu::RenderPipeline,
-    backdrop_blur: wgpu::RenderPipeline,
-    path_mask_composite: wgpu::RenderPipeline,
-    /// Writes transparent black inside the scissor rect. A render pass load
-    /// op clears the whole attachment, so a partial frame clears its damaged
-    /// region with this instead.
-    clear: wgpu::RenderPipeline,
-    present_retained: Option<wgpu::RenderPipeline>,
-}
-
 /// One frame allocation of instance data, ready to bind.
 struct InstanceBinding {
     bind_group: wgpu::BindGroup,
@@ -217,6 +202,7 @@ struct WgpuResources {
     queue: Arc<wgpu::Queue>,
     target: WgpuRenderTarget,
     pipelines: WgpuPipelines,
+    shaders: WgpuShaders,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
@@ -367,41 +353,23 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
-        let window_handle = window
-            .window_handle()
-            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
-
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            // Fall back to the display handle already provided via InstanceDescriptor::display.
-            raw_display_handle: None,
-            raw_window_handle: window_handle.as_raw(),
-        };
-
-        // Use the existing context's instance if available, otherwise create a new one.
-        // The surface must be created with the same instance that will be used for
-        // adapter selection, otherwise wgpu will panic.
-        let instance = gpu_context
-            .borrow()
-            .as_ref()
-            .map(|ctx| ctx.instance.clone())
-            .unwrap_or_else(|| WgpuContext::instance(Box::new(window.clone())));
-
-        // Safety: The caller guarantees that the window handle is valid for the
-        // lifetime of this renderer. In practice, the RawWindow struct is created
-        // from the native window handles and the surface is dropped before the window.
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(target)
-                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
-        };
-
         let mut ctx_ref = gpu_context.borrow_mut();
-        let context = match ctx_ref.as_mut() {
+        let (context, surface) = match ctx_ref.as_mut() {
             Some(context) => {
+                let window_handle = window
+                    .window_handle()
+                    .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+                // The caller keeps the window alive while the renderer exists,
+                // and the renderer drops the surface before the window.
+                let surface = create_surface(&context.instance, window_handle.as_raw())
+                    .context("Failed to create surface")?;
                 context.check_compatible_with_surface(&surface)?;
-                context
+                (context, surface)
             }
-            None => ctx_ref.insert(WgpuContext::new(instance, &surface, compositor_gpu)?),
+            None => {
+                let (context, surface) = WgpuContext::for_window(window, compositor_gpu, false)?;
+                (ctx_ref.insert(context), surface)
+            }
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
@@ -620,14 +588,14 @@ impl WgpuRenderer {
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
         let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
-        let pipelines = Self::create_pipelines(
+        let shaders = WgpuShaders::new(&device, dual_source_blending, uses_webgl_instance_data);
+        let pipelines = WgpuPipelines::new(
             &device,
             &bind_group_layouts,
+            &shaders,
             surface_format,
             alpha_mode,
             rendering_params.path_sample_count,
-            dual_source_blending,
-            uses_webgl_instance_data,
             surface_config.usage.contains(wgpu::TextureUsages::COPY_DST),
         );
 
@@ -753,6 +721,7 @@ impl WgpuRenderer {
             queue,
             target,
             pipelines,
+            shaders,
             bind_group_layouts,
             atlas_sampler,
             globals_buffer,
@@ -975,421 +944,6 @@ impl WgpuRenderer {
             },
             capacity,
         )
-    }
-
-    fn create_pipelines(
-        device: &wgpu::Device,
-        layouts: &WgpuBindGroupLayouts,
-        surface_format: wgpu::TextureFormat,
-        alpha_mode: wgpu::CompositeAlphaMode,
-        path_sample_count: u32,
-        dual_source_blending: bool,
-        uses_webgl_instance_data: bool,
-        target_copyable: bool,
-    ) -> WgpuPipelines {
-        // Diagnostic guard: verify the device actually has
-        // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
-        // feature mismatch caused a wgpu-hal abort, but we haven't
-        // identified the code path that produces the mismatch. This
-        // guard prevents the crash and logs more evidence.
-        // Remove this check once:
-        // a) We find and fix the root cause, or
-        // b) There are no reports of this warning appearing for some time.
-        let device_has_feature = device
-            .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
-        if dual_source_blending && !device_has_feature {
-            log::error!(
-                "BUG: dual_source_blending flag is true but device does not \
-                 have DUAL_SOURCE_BLENDING enabled (device features: {:?}). \
-                 Falling back to mono text rendering. Please report this at \
-                 https://github.com/zed-industries/zed/issues",
-                device.features(),
-            );
-        }
-        let dual_source_blending =
-            dual_source_blending && device_has_feature && !uses_webgl_instance_data;
-
-        let shader_source = if uses_webgl_instance_data {
-            WEBGL_SHADERS
-        } else {
-            STORAGE_BUFFER_SHADERS
-        };
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gpui_shaders"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-        });
-
-        let subpixel_shader_module = if dual_source_blending {
-            Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
-            }))
-        } else {
-            None
-        };
-
-        let blend_mode = match alpha_mode {
-            wgpu::CompositeAlphaMode::PreMultiplied => {
-                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
-            }
-            _ => wgpu::BlendState::ALPHA_BLENDING,
-        };
-
-        let color_target = wgpu::ColorTargetState {
-            format: surface_format,
-            blend: Some(blend_mode),
-            write_mask: wgpu::ColorWrites::ALL,
-        };
-
-        let create_pipeline = |name: &str,
-                               vs_entry: &str,
-                               fs_entry: &str,
-                               globals_layout: &wgpu::BindGroupLayout,
-                               data_layout: &wgpu::BindGroupLayout,
-                               texture_layout: Option<&wgpu::BindGroupLayout>,
-                               topology: wgpu::PrimitiveTopology,
-                               color_targets: &[Option<wgpu::ColorTargetState>],
-                               sample_count: u32,
-                               module: &wgpu::ShaderModule| {
-            let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &bind_group_layouts,
-                immediate_size: 0,
-            });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let quads = create_pipeline(
-            "quads",
-            "vs_quad",
-            "fs_quad",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let shadows = create_pipeline(
-            "shadows",
-            "vs_shadow",
-            "fs_shadow",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let path_rasterization = create_pipeline(
-            "path_rasterization",
-            "vs_path_rasterization",
-            "fs_path_rasterization",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleList,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            path_sample_count,
-            &shader_module,
-        );
-
-        let paths_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-
-        let paths = create_pipeline(
-            "paths",
-            "vs_path",
-            "fs_path",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(paths_blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            1,
-            &shader_module,
-        );
-
-        let underlines = create_pipeline(
-            "underlines",
-            "vs_underline",
-            "fs_underline",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let mono_sprites = create_pipeline(
-            "mono_sprites",
-            "vs_mono_sprite",
-            "fs_mono_sprite",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
-            let subpixel_blend = wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Src1,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrc1,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            };
-
-            Some(create_pipeline(
-                "subpixel_sprites",
-                "vs_subpixel_sprite",
-                "fs_subpixel_sprite",
-                &layouts.globals,
-                &layouts.instances,
-                Some(&layouts.texture),
-                wgpu::PrimitiveTopology::TriangleStrip,
-                &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(subpixel_blend),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
-                1,
-                subpixel_module,
-            ))
-        } else {
-            None
-        };
-
-        let poly_sprites = create_pipeline(
-            "poly_sprites",
-            "vs_poly_sprite",
-            "fs_poly_sprite",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let surfaces = create_pipeline(
-            "surfaces",
-            "vs_surface",
-            "fs_surface",
-            &layouts.globals,
-            &layouts.surfaces,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let backdrop_blur = create_pipeline(
-            "backdrop_blur",
-            "vs_backdrop_blur",
-            "fs_backdrop_blur",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
-            1,
-            &shader_module,
-        );
-
-        let path_mask_composite_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("path_mask_composite_layout"),
-                bind_group_layouts: &[
-                    Some(&layouts.globals),
-                    Some(&layouts.instances),
-                    Some(&layouts.texture),
-                    Some(&layouts.texture),
-                ],
-                immediate_size: 0,
-            });
-
-        let path_mask_composite = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("path_mask_composite"),
-            layout: Some(&path_mask_composite_layout),
-            vertex: wgpu::VertexState {
-                module: &shader_module,
-                entry_point: Some("vs_path"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader_module,
-                entry_point: Some("fs_path_mask_composite"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(paths_blend),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let clear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("clear_layout"),
-            bind_group_layouts: &[],
-            immediate_size: 0,
-        });
-        let create_fullscreen_pipeline =
-            |name: &str,
-             layout: Option<&wgpu::PipelineLayout>,
-             fragment: &wgpu::ShaderModule,
-             fragment_entry: &str| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(name),
-                    layout,
-                    vertex: wgpu::VertexState {
-                        module: &shader_module,
-                        entry_point: Some("vs_clear"),
-                        buffers: &[],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: fragment,
-                        entry_point: Some(fragment_entry),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: surface_format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count: 1,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let clear =
-            create_fullscreen_pipeline("clear", Some(&clear_layout), &shader_module, "fs_clear");
-        let present_retained = (!target_copyable).then(|| {
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("retained_present_shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
-            });
-            create_fullscreen_pipeline("present_retained", None, &shader, "fs_present")
-        });
-
-        WgpuPipelines {
-            quads,
-            shadows,
-            path_rasterization,
-            paths,
-            underlines,
-            mono_sprites,
-            subpixel_sprites,
-            poly_sprites,
-            surfaces,
-            backdrop_blur,
-            path_mask_composite,
-            clear,
-            present_retained,
-        }
     }
 
     fn create_path_intermediate(
@@ -1631,22 +1185,19 @@ impl WgpuRenderer {
             self.surface_config.alpha_mode = new_alpha_mode;
             let surface_config = self.surface_config.clone();
             let path_sample_count = self.rendering_params.path_sample_count;
-            let dual_source_blending = self.dual_source_blending;
-            let uses_webgl_instance_data = self.uses_webgl_instance_data;
             let Some(resources) = self.resources.as_mut() else {
                 return;
             };
             if let WgpuRenderTarget::Surface(surface) = &mut resources.target {
                 surface.configure(&resources.device, &surface_config);
             }
-            resources.pipelines = Self::create_pipelines(
+            resources.pipelines = WgpuPipelines::new(
                 &resources.device,
                 &resources.bind_group_layouts,
+                &resources.shaders,
                 surface_config.format,
                 surface_config.alpha_mode,
                 path_sample_count,
-                dual_source_blending,
-                uses_webgl_instance_data,
                 surface_config.usage.contains(wgpu::TextureUsages::COPY_DST),
             );
             resources.invalidate_intermediate_textures();
@@ -2771,10 +2322,6 @@ impl WgpuRenderer {
             .as_ref()
             .is_none_or(|ctx| ctx.device_lost());
 
-        let window_handle = window
-            .window_handle()
-            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
-
         let surface = if needs_new_context {
             log::warn!("GPU device lost, recreating context...");
 
@@ -2788,13 +2335,14 @@ impl WgpuRenderer {
             // may need more time to come back (e.g. after suspend/resume).
             std::thread::sleep(std::time::Duration::from_millis(350));
 
-            let instance = WgpuContext::instance(Box::new(window.clone()));
-            let surface = create_surface(&instance, window_handle.as_raw())?;
-            let new_context =
-                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
+            let (new_context, surface) =
+                WgpuContext::for_window(window, self.compositor_gpu, true)?;
             *gpu_context.borrow_mut() = Some(new_context);
             surface
         } else {
+            let window_handle = window
+                .window_handle()
+                .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
             let ctx_ref = gpu_context.borrow();
             let instance = &ctx_ref.as_ref().unwrap().instance;
             create_surface(instance, window_handle.as_raw())?
@@ -2990,22 +2538,6 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn create_surface(
-    instance: &wgpu::Instance,
-    raw_window_handle: raw_window_handle::RawWindowHandle,
-) -> anyhow::Result<wgpu::Surface<'static>> {
-    unsafe {
-        instance
-            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                // Fall back to the display handle already provided via InstanceDescriptor::display.
-                raw_display_handle: None,
-                raw_window_handle,
-            })
-            .map_err(|e| anyhow::anyhow!("{e}"))
-    }
-}
-
 struct RenderingParameters {
     path_sample_count: u32,
     gamma_ratios: [f32; 4],
@@ -3162,8 +2694,6 @@ mod tests {
         renderer.surface_config.usage = usage;
         let config = renderer.surface_config.clone();
         let path_sample_count = renderer.rendering_params.path_sample_count;
-        let dual_source_blending = renderer.dual_source_blending;
-        let uses_webgl_instance_data = renderer.uses_webgl_instance_data;
         let resources = renderer.resources_mut();
         let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("restricted_test_target"),
@@ -3186,14 +2716,13 @@ mod tests {
             format: config.format,
         };
         if configure_pipeline {
-            resources.pipelines = WgpuRenderer::create_pipelines(
+            resources.pipelines = WgpuPipelines::new(
                 &resources.device,
                 &resources.bind_group_layouts,
+                &resources.shaders,
                 config.format,
                 config.alpha_mode,
                 path_sample_count,
-                dual_source_blending,
-                uses_webgl_instance_data,
                 usage.contains(wgpu::TextureUsages::COPY_DST),
             );
             resources.invalidate_intermediate_textures();
