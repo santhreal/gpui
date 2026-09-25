@@ -366,6 +366,18 @@ pub trait PlatformDisplay: Debug {
         let origin = point(center.x - offset.width, center.y - offset.height);
         Bounds::new(origin, clipped_window_size)
     }
+
+    /// Device pixels per logical pixel for every window on this display,
+    /// on backends that fix one scale for all windows. X11 selects a
+    /// single scale at startup (`GPUI_X11_SCALE_FACTOR`, else `Xft.dpi`,
+    /// else the primary monitor's DPI) and reports its display bounds
+    /// divided by it, so a caller converting root pixels (randr monitors,
+    /// window rects) to logical coordinates reads the scale here before
+    /// any window exists. `None` where each window reports its own scale
+    /// through `Window::scale_factor`.
+    fn scale_factor(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// A notification posted to the operating system's notification center,
@@ -2183,6 +2195,16 @@ pub struct WindowParams {
     pub app_id: Option<String>,
 
     pub window_min_size: Option<Size<Pixels>>,
+
+    /// The background the window opens with. A platform that sizes its
+    /// renderer or its native surface to transparency creates them for
+    /// this background, instead of rebuilding them when
+    /// `set_background_appearance` follows the open.
+    #[cfg_attr(
+        not(all(any(target_os = "linux", target_os = "freebsd"), feature = "x11")),
+        allow(dead_code)
+    )]
+    pub window_background: WindowBackgroundAppearance,
 
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,

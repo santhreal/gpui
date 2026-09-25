@@ -44,8 +44,8 @@ use super::{
     ButtonOrScroll, ScrollDirection, X11Display, X11WindowStatePtr, XcbAtoms, XimCallbackEvent,
     XimHandler, button_or_scroll_from_event_detail, check_reply,
     clipboard::{self, Clipboard},
-    get_reply, get_valuator_axis_index, handle_connection_error, modifiers_from_state,
-    pressed_button_from_mask, xcb_flush,
+    get_reply, get_valuator_axis_index, modifiers_from_state,
+    pressed_button_from_mask, xcb_flush, xi_root_position,
 };
 
 use crate::linux::{
@@ -140,6 +140,22 @@ impl From<xim::ClientError> for EventHandlerError {
     }
 }
 
+/// What an error from `poll_for_event` does to the event source: an event
+/// that fails to parse is skipped, since the connection still works. Every
+/// other error is a closed connection: libxcb keeps a failed connection
+/// failed, every later poll fails the same way at once, and the socket stays
+/// readable, so a source that kept polling would spin. The error fails the
+/// source, which ends the event loop.
+fn poll_error_disposition(err: ConnectionError) -> Result<(), EventHandlerError> {
+    match err {
+        ConnectionError::ParseError(err) => {
+            log::warn!("skipping an X11 event that failed to parse: {err}");
+            Ok(())
+        }
+        err => Err(err.into()),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Xdnd {
     other_window: xproto::Window,
@@ -187,6 +203,7 @@ pub struct X11ClientState {
     pub(crate) xcb_connection: Rc<XCBConnection>,
     xkb_device_id: i32,
     client_side_decorations_supported: bool,
+    compositor_present: bool,
     pub(crate) x_root_index: usize,
     pub(crate) resource_database: Database,
     pub(crate) atoms: XcbAtoms,
@@ -533,6 +550,7 @@ impl X11Client {
             xcb_connection,
             xkb_device_id,
             client_side_decorations_supported,
+            compositor_present,
             x_root_index,
             resource_database,
             atoms,
@@ -638,14 +656,7 @@ impl X11Client {
                     Ok(None) => {
                         break;
                     }
-                    Err(err @ ConnectionError::IoError(..)) => {
-                        return Err(EventHandlerError::from(err));
-                    }
-                    Err(err) => {
-                        let err = handle_connection_error(err);
-                        log::warn!("error while polling for X11 events: {err:?}");
-                        break;
-                    }
+                    Err(err) => poll_error_disposition(err)?,
                 }
             }
 
@@ -1188,6 +1199,7 @@ impl X11Client {
                         let current_count = state.current_count;
 
                         drop(state);
+                        window.set_press_root(Some(xi_root_position(event.root_x, event.root_y)));
                         window.handle_input(PlatformInput::MouseDown(gpui::MouseDownEvent {
                             button,
                             position,
@@ -1234,6 +1246,7 @@ impl X11Client {
                     Some(ButtonOrScroll::Button(button)) => {
                         let click_count = state.current_count;
                         drop(state);
+                        window.set_press_root(None);
                         window.handle_input(PlatformInput::MouseUp(gpui::MouseUpEvent {
                             button,
                             position,
@@ -1619,6 +1632,7 @@ impl LinuxClient for X11Client {
 
         let xcb_connection = state.xcb_connection.clone();
         let client_side_decorations_supported = state.client_side_decorations_supported;
+        let compositor_present = state.compositor_present;
         let x_root_index = state.x_root_index;
         let atoms = state.atoms;
         let scale_factor = state.scale_factor;
@@ -1638,6 +1652,7 @@ impl LinuxClient for X11Client {
             params,
             &xcb_connection,
             client_side_decorations_supported,
+            compositor_present,
             x_root_index,
             x_window,
             &atoms,
@@ -3125,5 +3140,44 @@ mod tests {
 
         // Assert pressing space while on the Czech layout still types a space.
         assert_eq!(key_event_state.key_get_utf8(space), " ");
+    }
+
+    /// A malformed event is skipped and the source keeps running. Every
+    /// other connection error fails the source, ending the event loop,
+    /// instead of leaving a level-triggered source on a dead socket that
+    /// fires in a busy loop. Covers every `ConnectionError` variant x11rb
+    /// 0.13 defines; a new variant falls into the failing arm.
+    #[test]
+    fn poll_errors_skip_bad_events_and_end_the_loop_on_a_dead_connection() {
+        use x11rb::errors::ParseError;
+
+        for parse_error in [
+            ParseError::InsufficientData,
+            ParseError::ConversionFailed,
+            ParseError::InvalidExpression,
+            ParseError::InvalidValue,
+            ParseError::MissingFileDescriptors,
+        ] {
+            assert!(
+                poll_error_disposition(ConnectionError::ParseError(parse_error)).is_ok(),
+                "{parse_error:?}"
+            );
+        }
+
+        let fatal = [
+            ConnectionError::UnknownError,
+            ConnectionError::UnsupportedExtension,
+            ConnectionError::MaximumRequestLengthExceeded,
+            ConnectionError::FdPassingFailed,
+            ConnectionError::InsufficientMemory,
+            ConnectionError::IoError(std::io::ErrorKind::BrokenPipe.into()),
+        ];
+        for err in fatal {
+            let name = format!("{err:?}");
+            match poll_error_disposition(err) {
+                Err(EventHandlerError::XCBConnectionError(_)) => {}
+                other => panic!("{name} must fail the source, got {other:?}"),
+            }
+        }
     }
 }

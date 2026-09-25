@@ -18,7 +18,7 @@ use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
     errors::ConnectionError,
-    properties::{WmHints, WmSizeHints},
+    properties::WmHints,
     protocol::{
         sync,
         xinput::{self, ConnectionExt as _},
@@ -33,6 +33,10 @@ use std::{
 };
 
 use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
+
+mod placement;
+pub(crate) use placement::xi_root_position;
+use placement::{ConfigureChange, configure_change, creation_background_pixel, normal_hints};
 
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
@@ -286,6 +290,9 @@ pub struct X11WindowState {
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    /// Root position of the button press the pointer is held from, the
+    /// anchor a window manager measures a `_NET_WM_MOVERESIZE` drag from.
+    press_root: Option<(i32, i32)>,
 }
 
 impl X11WindowState {
@@ -452,6 +459,7 @@ impl X11WindowState {
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
+        compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
         atoms: &XcbAtoms,
@@ -494,7 +502,8 @@ impl X11WindowState {
             id
         };
 
-        let win_aux = xproto::CreateWindowAux::new()
+        let transparent = params.window_background != WindowBackgroundAppearance::Opaque;
+        let mut win_aux = xproto::CreateWindowAux::new()
             // https://stackoverflow.com/questions/43218127/x11-xlib-xcb-creating-a-window-requires-border-pixel-if-specifying-colormap-wh
             .border_pixel(visual_set.black_pixel)
             .colormap(colormap)
@@ -508,6 +517,13 @@ impl X11WindowState {
                     | xproto::EventMask::PROPERTY_CHANGE
                     | xproto::EventMask::VISIBILITY_CHANGE,
             );
+        if let Some(pixel) = creation_background_pixel(
+            transparent,
+            compositor_present,
+            visual_set.transparent.is_some(),
+        ) {
+            win_aux = win_aux.background_pixel(pixel);
+        }
 
         let mut bounds = params.bounds.to_device_pixels(scale_factor);
         if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
@@ -527,7 +543,7 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    bounds.origin.x.0 + 2,
+                    bounds.origin.x.0,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
@@ -537,7 +553,7 @@ impl X11WindowState {
                 visual.depth,
                 x_window,
                 visual_set.root,
-                (bounds.origin.x.0 + 2) as i16,
+                bounds.origin.x.0 as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -562,19 +578,6 @@ impl X11WindowState {
                 ),
             )?;
 
-            let reply = get_reply(|| "X11 GetGeometry failed.", xcb.get_geometry(x_window))?;
-            if reply.x == 0 && reply.y == 0 {
-                bounds.origin.x.0 += 2;
-                // Work around a bug where our rendered content appears
-                // outside the window bounds when opened at the default position
-                // (14px, 49px on X + Gnome + Ubuntu 22).
-                let x = bounds.origin.x.0;
-                let y = bounds.origin.y.0;
-                check_reply(
-                    || format!("X11 ConfigureWindow failed. x: {}, y: {}", x, y),
-                    xcb.configure_window(x_window, &xproto::ConfigureWindowAux::new().x(x).y(y)),
-                )?;
-            }
             if let Some(titlebar) = params.titlebar
                 && let Some(title) = titlebar.title
             {
@@ -756,11 +759,11 @@ impl X11WindowState {
                     // Note: this has to be done after the GPU init, or otherwise
                     // the sizes are immediately invalidated.
                     size: query_render_extent(xcb, x_window)?,
-                    // We set it to transparent by default, even if we have client-side
-                    // decorations, since those seem to work on X11 even without `true` here.
-                    // If the window appearance changes, then the renderer will get updated
-                    // too
-                    transparent: false,
+                    // Created for the opening background: the
+                    // set_background_appearance that follows the open is
+                    // then no change, where a mismatch reconfigures the
+                    // surface and rebuilds every pipeline.
+                    transparent,
                     preferred_present_mode: None,
                 };
                 WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
@@ -768,20 +771,21 @@ impl X11WindowState {
 
             renderer.set_subpixel_layout(is_bgr);
 
-            // Set max window size hints based on the GPU's maximum texture dimension.
-            // This prevents the window from being resized larger than what the GPU can render.
-            let max_texture_size = renderer.max_texture_size();
-            let mut size_hints = WmSizeHints::new();
-            if let Some(size) = params.window_min_size {
-                size_hints.min_size =
-                    Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
-            }
-            size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
+            // WM_NORMAL_HINTS go on before the map: the position, the
+            // minimum size, and the GPU's maximum texture dimension as the
+            // maximum size, so the window never grows past what the
+            // renderer can draw.
+            let size_hints = normal_hints(
+                bounds.origin,
+                params.window_min_size,
+                scale_factor,
+                renderer.max_texture_size(),
+            );
             check_reply(
                 || {
                     format!(
-                        "X11 change of WM_SIZE_HINTS failed. max_size: {:?}",
-                        max_texture_size
+                        "X11 change of WM_SIZE_HINTS failed. hints: {:?}",
+                        size_hints
                     )
                 },
                 size_hints.set_normal_hints(xcb, x_window),
@@ -835,13 +839,14 @@ impl X11WindowState {
                 hidden: false,
                 appearance,
                 handle,
-                background_appearance: WindowBackgroundAppearance::Opaque,
+                background_appearance: params.window_background,
                 destroyed: false,
                 client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
                 edge_constraints: None,
                 accesskit_adapter: None,
+                press_root: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
             })
@@ -872,7 +877,16 @@ impl Drop for X11Window {
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
         }
-
+        // Unmap before the renderer goes. Tearing down the swapchain of a
+        // mapped window leaves its storage black, and a compositor paints
+        // that for a frame before the DestroyWindow below takes the window
+        // off screen. The checked request is a round trip: the server has
+        // unmapped the window before the driver touches it.
+        check_reply(
+            || "X11 UnmapWindow failure.",
+            self.0.xcb.unmap_window(self.0.x_window),
+        )
+        .log_err();
         state.renderer.destroy();
 
         let destroy_x_window = maybe!({
@@ -920,6 +934,7 @@ impl X11Window {
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
+        compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
         atoms: &XcbAtoms,
@@ -939,6 +954,7 @@ impl X11Window {
                 params,
                 xcb,
                 client_side_decorations_supported,
+                compositor_present,
                 x_main_screen_index,
                 x_window,
                 atoms,
@@ -1010,17 +1026,27 @@ impl X11Window {
             self.0.xcb.ungrab_pointer(x11rb::CURRENT_TIME),
         )?;
 
-        let pointer = get_reply(
-            || "X11 QueryPointer before move/resize of window failed.",
-            self.0.xcb.query_pointer(self.0.x_window),
-        )?;
+        // The window manager moves the window by the pointer's travel from
+        // this point. The press anchors the drag where it began: the
+        // pointer may have moved on before the press was handled, and the
+        // window would trail it by that distance.
+        let (root_x, root_y) = match state.press_root {
+            Some(at) => at,
+            None => {
+                let pointer = get_reply(
+                    || "X11 QueryPointer before move/resize of window failed.",
+                    self.0.xcb.query_pointer(self.0.x_window),
+                )?;
+                (pointer.root_x.into(), pointer.root_y.into())
+            }
+        };
         let message = ClientMessageEvent::new(
             32,
             self.0.x_window,
             state.atoms._NET_WM_MOVERESIZE,
             [
-                pointer.root_x as u32,
-                pointer.root_y as u32,
+                root_x as u32,
+                root_y as u32,
                 flag,
                 0, // Left mouse button
                 0,
@@ -1279,44 +1305,51 @@ impl X11WindowStatePtr {
         bounds.map(|b| b.scale(scale_factor))
     }
 
+    /// Apply a ConfigureNotify reporting `bounds` in root device pixels.
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
-        let (is_resize, content_size, scale_factor) = {
+        let mut resize_args = None;
+        let mut moved = false;
+        {
             let mut state = self.state.borrow_mut();
-            let bounds = bounds.map(|f| px(f as f32 / state.scale_factor));
-
-            let is_resize = bounds.size.width != state.bounds.size.width
-                || bounds.size.height != state.bounds.size.height;
-
-            // If it's a resize event (only width/height changed), we ignore `bounds.origin`
-            // because it contains wrong values.
-            if is_resize {
-                state.bounds.size = bounds.size;
-            } else {
-                state.bounds = bounds;
+            let reported = bounds.map(|f| px(f as f32 / state.scale_factor));
+            match configure_change(state.bounds, reported) {
+                ConfigureChange::Resized(size) => {
+                    state.bounds.size = size;
+                    let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
+                    state.renderer.update_drawable_size(gpu_size);
+                    resize_args = Some((state.content_size(), state.scale_factor));
+                }
+                ConfigureChange::Moved(origin) => {
+                    state.bounds.origin = origin;
+                    moved = true;
+                }
+                ConfigureChange::Unchanged => {}
             }
-
-            let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
-            state.renderer.update_drawable_size(gpu_size);
-            let result = (is_resize, state.content_size(), state.scale_factor);
             if let Some(value) = state.last_sync_counter.take() {
                 check_reply(
                     || "X11 sync SetCounter failed.",
                     sync::set_counter(&self.xcb, state.counter_id, value),
                 )?;
             }
-            result
-        };
+        }
 
         let mut callbacks = self.callbacks.borrow_mut();
-        if let Some(ref mut fun) = callbacks.resize {
+        if let Some((content_size, scale_factor)) = resize_args
+            && let Some(fun) = &mut callbacks.resize
+        {
             fun(content_size, scale_factor)
         }
 
-        if !is_resize && let Some(ref mut fun) = callbacks.moved {
+        if moved && let Some(fun) = &mut callbacks.moved {
             fun();
         }
 
         Ok(())
+    }
+
+    /// Record the root position of a button press, `None` once released.
+    pub fn set_press_root(&self, at: Option<(i32, i32)>) {
+        self.state.borrow_mut().press_root = at;
     }
 
     pub fn set_active(&self, focus: bool) {
