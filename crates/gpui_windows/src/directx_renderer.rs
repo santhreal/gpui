@@ -671,11 +671,18 @@ impl DirectXRenderer {
         let mut vertices = Vec::new();
 
         for path in paths {
+            // Clip in window space, as the vertex shader transforms each vertex
+            // before clipping.
+            let bounds = path
+                .transformation
+                .apply_to_bounds(path.bounds)
+                .intersect(&path.content_mask.bounds);
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
-                bounds: path.clipped_bounds(),
+                bounds,
+                transformation: path.transformation,
             }));
         }
 
@@ -1395,6 +1402,7 @@ struct PathRasterizationSprite {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    transformation: TransformationMatrix,
 }
 
 #[derive(Clone, Copy)]

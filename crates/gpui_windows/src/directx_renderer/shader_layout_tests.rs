@@ -141,12 +141,12 @@ fn rust_layout(module: ShaderModule, name: &str) -> Option<Layout> {
                 "st_position": st_position,
                 "color": color,
                 "bounds": bounds,
+                "transformation": transformation,
             }),
         ),
-        ShaderModule::PathSprite | ShaderModule::PathClipComposite => (
-            "path_sprites",
-            layout!(PathSprite { "bounds": bounds }),
-        ),
+        ShaderModule::PathSprite | ShaderModule::PathClipComposite => {
+            ("path_sprites", layout!(PathSprite { "bounds": bounds }))
+        }
         ShaderModule::MonochromeSprite => (
             "mono_sprites",
             layout!(MonochromeSprite {
