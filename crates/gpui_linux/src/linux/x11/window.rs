@@ -32,7 +32,7 @@ use std::{
     cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
-use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
+use super::{FrameLoop, X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
 
 mod placement;
 pub(crate) use placement::xi_root_position;
@@ -307,6 +307,7 @@ pub(crate) struct X11WindowStatePtr {
     pub(crate) callbacks: Rc<RefCell<Callbacks>>,
     xcb: Rc<XCBConnection>,
     pub(crate) x_window: xproto::Window,
+    pub(crate) frame_loop: Rc<FrameLoop>,
 }
 
 impl rwh::HasWindowHandle for RawWindow {
@@ -873,6 +874,9 @@ pub(crate) struct X11Window(pub X11WindowStatePtr);
 impl Drop for X11Window {
     fn drop(&mut self) {
         let mut state = self.0.state.borrow_mut();
+        // The client forgets the window in a deferred task; a frame that
+        // fired before it runs would draw a destroyed window.
+        self.0.frame_loop.hide();
 
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
@@ -943,6 +947,7 @@ impl X11Window {
         parent_window: Option<X11WindowStatePtr>,
         supports_xinput_gestures: bool,
         is_bgr: bool,
+        frame_loop: Rc<FrameLoop>,
     ) -> anyhow::Result<Self> {
         let ptr = X11WindowStatePtr {
             state: Rc::new(RefCell::new(X11WindowState::new(
@@ -967,6 +972,7 @@ impl X11Window {
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             xcb: xcb.clone(),
             x_window,
+            frame_loop,
         };
 
         let state = ptr.state.borrow_mut();
@@ -1704,6 +1710,15 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().fullscreen
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let frame_loop = Rc::downgrade(&self.0.frame_loop);
+        Some(Rc::new(move || {
+            if let Some(frame_loop) = frame_loop.upgrade() {
+                frame_loop.wake();
+            }
+        }))
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -1767,6 +1782,7 @@ impl PlatformWindow for X11Window {
             }
 
             inner.force_render_after_recovery = true;
+            self.0.frame_loop.wake();
             return;
         }
 
@@ -1774,6 +1790,7 @@ impl PlatformWindow for X11Window {
 
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
+            self.0.frame_loop.wake();
         }
     }
 
