@@ -26,8 +26,6 @@
 //!```
 //!
 //! The keybindings themselves are managed independently by calling cx.bind_keys().
-//! (Though mostly when developing Zed itself, you just need to add a new line to
-//!  assets/keymaps/default-{platform}.json).
 //!
 //! ```ignore
 //! cx.bind_keys([

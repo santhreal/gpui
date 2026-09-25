@@ -112,7 +112,8 @@ impl<T: ReceiveData> DataOffer<T> {
                 }
             };
         }
-        self.read_text(connection).or_else(|| self.read_image(connection))
+        self.read_text(connection)
+            .or_else(|| self.read_image(connection))
     }
 
     fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {

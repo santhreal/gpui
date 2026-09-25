@@ -1,46 +1,84 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
+# santh-gpui
 
-# Santh GPUI
-
-A reusable GPU-accelerated UI framework fork derived from
-[Zed](https://github.com/zed-industries/zed).
-
-The canonical repository is
-[`santhreal/gpui`](https://github.com/santhreal/gpui). Framework changes
-are maintained here. Applications keep their own surfaces, themes, and domain
-logic in their repositories.
+santh-gpui is the GPU-accelerated UI framework of every Santh desktop
+application: iris, the Veyyon desktop, and aria. It is derived from
+[Zed](https://github.com/zed-industries/zed)'s GPUI; this repository holds
+the framework crates and their dependencies only, with the upstream history.
 
 ## Packages
 
-- `gpui`: entities, windows, elements, layout, input, and application contexts.
-- `gpui_platform`: native platform integration.
-- `gpui_wgpu`: the wgpu renderer, text system, and offscreen rendering.
+| Package | Contents |
+| ------- | -------- |
+| `gpui` | Application and window contexts, entities, elements, layout, input, text, animation. |
+| `gpui_platform` | `application()` and `headless()`: the platform for the current OS. |
+| `gpui_linux` | X11 and Wayland windows, input, clipboard, and display integration. |
+| `gpui_macos`, `gpui_apple` | AppKit windows and the Metal renderer. |
+| `gpui_windows` | Win32 windows and the DirectX 11 renderer. |
+| `gpui_wgpu` | The wgpu (Vulkan) renderer used on Linux, the cosmic-text text system, and offscreen rendering. |
+| `gpui_web` | The browser platform. |
+| `gpui_tokio` | A Tokio runtime driven from GPUI executors. |
+| `gpui_macros` | `IntoElement`, `Render`, and action derives. |
 
-The repository retains the upstream workspace and commit history. Applications
-depend on the GPUI packages rather than the Zed editor application.
+`collections`, `refineable`, `sum_tree`, `scheduler`, `util`, `path`,
+`http_client`, and `media` are internal dependencies of the packages above.
 
-## Use from another Rust project
+## Use
 
-Pin a revision:
+Pin one revision of this repository for every GPUI package:
 
 ```toml
 [dependencies]
-gpui = { git = "https://github.com/santhreal/gpui.git", rev = "ee35ff2e13f37ed75038d6c8a88fe4e1b737832e" }
+gpui = { git = "https://github.com/santhreal/santh-gpui.git", rev = "<rev>" }
+gpui_platform = { git = "https://github.com/santhreal/santh-gpui.git", rev = "<rev>", features = ["x11", "wayland"] }
 ```
 
-Use the same revision for companion packages such as `gpui_platform` and
-`gpui_wgpu`. All consuming projects resolve framework packages from this
-repository. Do not copy framework sources into application repositories.
+`gpui_platform` enables no Linux window system by default; enable `x11`,
+`wayland`, or both. Add `gpui_wgpu` and `gpui_tokio` at the same revision
+when you use offscreen rendering or Tokio.
 
-## Source reference
+```rust
+use gpui::{App, Context, Window, WindowOptions, div, prelude::*};
 
-- [GPUI package](crates/gpui)
-- [Platform integration](crates/gpui_platform)
-- [wgpu renderer](crates/gpui_wgpu)
+struct Hello;
 
-## Licensing
+impl Render for Hello {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child("Hello")
+    }
+}
 
-GPUI is licensed under Apache-2.0. Other components retain the licenses specified
-in their crate manifests; the upstream workspace also includes GPL-3.0-or-later
-components. Preserve the upstream license and copyright notices.
+fn main() {
+    gpui_platform::application().run(|cx: &mut App| {
+        cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Hello))
+            .expect("open window");
+    });
+}
+```
+
+`crates/gpui/examples` has runnable examples: `cargo run -p gpui --example hello_world`.
+
+## Rules for applications
+
+- Depend on this repository only. Do not depend on crates.io `gpui`,
+  upstream Zed, another fork, or a vendored copy of any package here.
+- Framework fixes, platform fixes, render primitives, animation, and
+  performance work land here on `main`; applications then move their `rev`.
+- An application does not carry a patch to a package here.
+
+## Build
+
+The toolchain is pinned in `rust-toolchain.toml`.
+
+```sh
+cargo check --workspace --all-targets
+cargo test -p gpui
+```
+
+Linux builds need the X11, Wayland, xkbcommon, fontconfig, and Vulkan loader
+development packages; `.github/workflows/ci.yml` lists them.
+
+## License
+
+The packages are licensed under Apache-2.0 (`LICENSE-APACHE`). The fonts in
+`assets/fonts` are licensed under the SIL Open Font License 1.1; each font
+directory holds its license.

@@ -669,7 +669,9 @@ impl LineLayoutCache {
             let text = SharedString::from(text);
             let mut font_runs = SmallVec::<[FontRun; 2]>::new();
             for run in runs {
-                if let Some(last) = font_runs.last_mut() && last.font_id == run.font_id {
+                if let Some(last) = font_runs.last_mut()
+                    && last.font_id == run.font_id
+                {
                     last.len += run.len;
                 } else {
                     font_runs.push(FontRun {
@@ -678,7 +680,9 @@ impl LineLayoutCache {
                     });
                 }
             }
-            let layout = self.text_system.layout_line_cached(&text, font_size, &font_runs);
+            let layout = self
+                .text_system
+                .layout_line_cached(&text, font_size, &font_runs);
             let has_tracking = runs.iter().any(|r| r.tracking != px(0.));
             let layout = if has_tracking || force_width.is_some() {
                 let mut layout = (*layout).clone();
@@ -834,7 +838,9 @@ impl LineLayoutCache {
         let text = materialize_text();
         let mut font_runs = SmallVec::<[FontRun; 2]>::new();
         for run in runs {
-            if let Some(last) = font_runs.last_mut() && last.font_id == run.font_id {
+            if let Some(last) = font_runs.last_mut()
+                && last.font_id == run.font_id
+            {
                 last.len += run.len;
             } else {
                 font_runs.push(FontRun {
@@ -843,7 +849,9 @@ impl LineLayoutCache {
                 });
             }
         }
-        let layout = self.text_system.layout_line_cached(&text, font_size, &font_runs);
+        let layout = self
+            .text_system
+            .layout_line_cached(&text, font_size, &font_runs);
         let has_tracking = runs.iter().any(|r| r.tracking != px(0.));
         let layout = if has_tracking || force_width.is_some() {
             let mut layout = (*layout).clone();
@@ -1319,138 +1327,175 @@ mod tests {
     #[gpui::test]
     fn test_shaped_line_positive_and_zero_tracking(cx: &mut App) {
         let text_system = WindowTextSystem::new(cx.text_system().clone());
-            let font_size = px(16.);
-            let text: SharedString = "Hello".into();
-            let font = font("Helvetica");
+        let font_size = px(16.);
+        let text: SharedString = "Hello".into();
+        let font = font("Helvetica");
 
-            let untracked_run = TextRun {
-                len: text.len(),
+        let untracked_run = TextRun {
+            len: text.len(),
+            font,
+            color: Default::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+            tracking: px(0.),
+        };
+        let untracked_line = text_system.shape_line(
+            text.clone(),
+            font_size,
+            std::slice::from_ref(&untracked_run),
+            None,
+        );
+        let glyph_count = untracked_line
+            .layout
+            .runs
+            .iter()
+            .map(|r| r.glyphs.len())
+            .sum::<usize>();
+        assert!(glyph_count > 1, "expected at least 2 glyphs in test word");
+        let untracked_last_glyph_x = untracked_line
+            .layout
+            .runs
+            .last()
+            .unwrap()
+            .glyphs
+            .last()
+            .unwrap()
+            .position
+            .x;
+        let untracked_width = untracked_line.width();
+
+        // Positive tracking
+        let tracking_amount = px(2.5);
+        let tracked_run = TextRun {
+            tracking: tracking_amount,
+            ..untracked_run.clone()
+        };
+        let tracked_line = text_system.shape_line(text.clone(), font_size, &[tracked_run], None);
+        let tracked_last_glyph_x = tracked_line
+            .layout
+            .runs
+            .last()
+            .unwrap()
+            .glyphs
+            .last()
+            .unwrap()
+            .position
+            .x;
+        let tracked_width = tracked_line.width();
+
+        let expected_delta = px((glyph_count - 1) as f32 * tracking_amount.0);
+        assert_eq!(
+            tracked_width - untracked_width,
+            expected_delta,
+            "reported width must increase by (glyph count - 1) * tracking"
+        );
+        assert_eq!(
+            tracked_last_glyph_x - untracked_last_glyph_x,
+            expected_delta,
+            "x position of last glyph must move by that same amount"
+        );
+        assert_eq!(
+            tracked_width - tracked_last_glyph_x,
+            untracked_width - untracked_last_glyph_x,
+            "trailing space must remain identical to untracked line"
+        );
+
+        // Zero tracking leaves both identical to untracked line
+        let zero_run = TextRun {
+            tracking: px(0.),
+            ..untracked_run
+        };
+        let zero_line = text_system.shape_line(text, font_size, &[zero_run], None);
+        assert_eq!(zero_line.width(), untracked_width);
+        let zero_last_glyph_x = zero_line
+            .layout
+            .runs
+            .last()
+            .unwrap()
+            .glyphs
+            .last()
+            .unwrap()
+            .position
+            .x;
+        assert_eq!(zero_last_glyph_x, untracked_last_glyph_x);
+    }
+
+    #[gpui::test]
+    fn test_shaped_line_two_runs_different_tracking(cx: &mut App) {
+        let text_system = WindowTextSystem::new(cx.text_system().clone());
+        let font_size = px(16.);
+        let text: SharedString = "Hello world".into();
+        let font = font("Helvetica");
+
+        let untracked_runs = [
+            TextRun {
+                len: 6, // "Hello "
                 font: font.clone(),
                 color: Default::default(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
                 tracking: px(0.),
-            };
-            let untracked_line = text_system.shape_line(text.clone(), font_size, &[untracked_run.clone()], None);
-            let glyph_count = untracked_line.layout.runs.iter().map(|r| r.glyphs.len()).sum::<usize>();
-            assert!(glyph_count > 1, "expected at least 2 glyphs in test word");
-            let untracked_last_glyph_x = untracked_line.layout.runs.last().unwrap().glyphs.last().unwrap().position.x;
-            let untracked_width = untracked_line.width();
-
-            // Positive tracking
-            let tracking_amount = px(2.5);
-            let tracked_run = TextRun {
-                tracking: tracking_amount,
-                ..untracked_run.clone()
-            };
-            let tracked_line = text_system.shape_line(text.clone(), font_size, &[tracked_run], None);
-            let tracked_last_glyph_x = tracked_line.layout.runs.last().unwrap().glyphs.last().unwrap().position.x;
-            let tracked_width = tracked_line.width();
-
-            let expected_delta = px((glyph_count - 1) as f32 * tracking_amount.0);
-            assert_eq!(
-                tracked_width - untracked_width,
-                expected_delta,
-                "reported width must increase by (glyph count - 1) * tracking"
-            );
-            assert_eq!(
-                tracked_last_glyph_x - untracked_last_glyph_x,
-                expected_delta,
-                "x position of last glyph must move by that same amount"
-            );
-            assert_eq!(
-                tracked_width - tracked_last_glyph_x,
-                untracked_width - untracked_last_glyph_x,
-                "trailing space must remain identical to untracked line"
-            );
-
-            // Zero tracking leaves both identical to untracked line
-            let zero_run = TextRun {
+            },
+            TextRun {
+                len: 5, // "world"
+                font,
+                color: Default::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
                 tracking: px(0.),
-                ..untracked_run.clone()
-            };
-            let zero_line = text_system.shape_line(text.clone(), font_size, &[zero_run], None);
-            assert_eq!(zero_line.width(), untracked_width);
-            let zero_last_glyph_x = zero_line.layout.runs.last().unwrap().glyphs.last().unwrap().position.x;
-            assert_eq!(zero_last_glyph_x, untracked_last_glyph_x);
-    }
+            },
+        ];
 
-    #[gpui::test]
-    fn test_shaped_line_two_runs_different_tracking(cx: &mut App) {
-        let text_system = WindowTextSystem::new(cx.text_system().clone());
-            let font_size = px(16.);
-            let text: SharedString = "Hello world".into();
-            let font = font("Helvetica");
+        let untracked_line = text_system.shape_line(text.clone(), font_size, &untracked_runs, None);
+        let untracked_run1_glyphs = untracked_line
+            .layout
+            .runs
+            .iter()
+            .flat_map(|r| r.glyphs.iter())
+            .filter(|g| g.index < 6)
+            .count();
+        let untracked_run2_origin = untracked_line
+            .layout
+            .runs
+            .iter()
+            .flat_map(|r| r.glyphs.iter())
+            .find(|g| g.index >= 6)
+            .unwrap()
+            .position
+            .x;
 
-            let untracked_runs = [
-                TextRun {
-                    len: 6, // "Hello "
-                    font: font.clone(),
-                    color: Default::default(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                    tracking: px(0.),
-                },
-                TextRun {
-                    len: 5, // "world"
-                    font: font.clone(),
-                    color: Default::default(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                    tracking: px(0.),
-                },
-            ];
+        let tracking1 = px(2.0);
+        let tracking2 = px(4.0);
+        let tracked_runs = [
+            TextRun {
+                tracking: tracking1,
+                ..untracked_runs[0].clone()
+            },
+            TextRun {
+                tracking: tracking2,
+                ..untracked_runs[1].clone()
+            },
+        ];
 
-            let untracked_line = text_system.shape_line(text.clone(), font_size, &untracked_runs, None);
-            let untracked_run1_glyphs = untracked_line
-                .layout
-                .runs
-                .iter()
-                .flat_map(|r| r.glyphs.iter())
-                .filter(|g| g.index < 6)
-                .count();
-            let untracked_run2_origin = untracked_line
-                .layout
-                .runs
-                .iter()
-                .flat_map(|r| r.glyphs.iter())
-                .find(|g| g.index >= 6)
-                .unwrap()
-                .position
-                .x;
+        let tracked_line = text_system.shape_line(text, font_size, &tracked_runs, None);
+        let tracked_run2_origin = tracked_line
+            .layout
+            .runs
+            .iter()
+            .flat_map(|r| r.glyphs.iter())
+            .find(|g| g.index >= 6)
+            .unwrap()
+            .position
+            .x;
 
-            let tracking1 = px(2.0);
-            let tracking2 = px(4.0);
-            let tracked_runs = [
-                TextRun {
-                    tracking: tracking1,
-                    ..untracked_runs[0].clone()
-                },
-                TextRun {
-                    tracking: tracking2,
-                    ..untracked_runs[1].clone()
-                },
-            ];
-
-            let tracked_line = text_system.shape_line(text.clone(), font_size, &tracked_runs, None);
-            let tracked_run2_origin = tracked_line
-                .layout
-                .runs
-                .iter()
-                .flat_map(|r| r.glyphs.iter())
-                .find(|g| g.index >= 6)
-                .unwrap()
-                .position
-                .x;
-
-            let expected_run1_advance = px(untracked_run1_glyphs as f32 * tracking1.0);
-            assert_eq!(
-                tracked_run2_origin - untracked_run2_origin,
-                expected_run1_advance,
-                "second run's origin must account for the first run's added advance"
-            );
+        let expected_run1_advance = px(untracked_run1_glyphs as f32 * tracking1.0);
+        assert_eq!(
+            tracked_run2_origin - untracked_run2_origin,
+            expected_run1_advance,
+            "second run's origin must account for the first run's added advance"
+        );
     }
 }

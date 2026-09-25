@@ -1039,7 +1039,8 @@ impl Clipboard {
 
         // image formats first, as they are more specific, and read will return the first
         // format that the contents can be converted to
-        let mut format_atoms = Vec::with_capacity(image_entries.len() + text_format_atoms.len() + 1);
+        let mut format_atoms =
+            Vec::with_capacity(image_entries.len() + text_format_atoms.len() + 1);
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
         format_atoms.push(self.inner.atoms.URI_LIST);
         format_atoms.extend_from_slice(text_format_atoms);

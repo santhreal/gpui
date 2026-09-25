@@ -95,7 +95,6 @@ strum.workspace = true
 sum_tree.workspace = true
 taffy = "=0.13.0"
 thiserror.workspace = true
-tracing.workspace = true
 gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
@@ -107,7 +106,6 @@ url.workspace = true
 uuid.workspace = true
 web-time.workspace = true
 heapless.workspace = true
-ztracing.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
@@ -163,7 +161,6 @@ ignored = [
     "getrandom",
     "objc2",
     "objc2-metal",
-    "tracing",
 ]
 ignored-paths = ["src/_ownership_and_data_flow.rs"]
 
