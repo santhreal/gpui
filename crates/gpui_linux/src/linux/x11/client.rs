@@ -46,7 +46,9 @@ use super::{
     X11WindowStatePtr, XcbAtoms, XimCallbackEvent, XimHandler, button_or_scroll_from_event_detail,
     check_reply,
     clipboard::{self, Clipboard},
-    get_reply, get_valuator_axis_index, modifiers_from_state,
+    get_reply, get_valuator_axis_index,
+    gpu_context::{self, WindowGpu},
+    modifiers_from_state,
     pressed_button_from_mask, xcb_flush, xi_root_position,
 };
 
@@ -187,6 +189,8 @@ pub struct X11ClientState {
 
     pub(crate) gpu_context: GpuContext,
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
+    /// The context from the GPU context thread, until the first window.
+    pending_gpu_context: Option<gpu_context::PendingContext>,
 
     pub(crate) scale_factor: f32,
 
@@ -309,6 +313,15 @@ pub(crate) struct X11Client(pub(crate) Rc<RefCell<X11ClientState>>);
 
 impl X11Client {
     pub(crate) fn new() -> anyhow::Result<Self> {
+        // The X connection is set up before the GPU context thread starts
+        // (see gpu_context.rs).
+        let (xcb_connection, x_root_index) = XCBConnection::connect(None)?;
+        let xcb_connection = Rc::new(xcb_connection);
+        let compositor_gpu =
+            detect_compositor_gpu(&xcb_connection, &xcb_connection.setup().roots[x_root_index]);
+        let pending_gpu_context =
+            gpu_context::spawn(&xcb_connection, x_root_index, compositor_gpu)?;
+
         let event_loop = EventLoop::try_new()?;
 
         let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
@@ -350,7 +363,6 @@ impl X11Client {
                 anyhow!("Failed to initialize event loop handling of wake events: {err:?}")
             })?;
 
-        let (xcb_connection, x_root_index) = XCBConnection::connect(None)?;
         xcb_connection.prefetch_extension_information(xkb::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(randr::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(render::X11_EXTENSION_NAME)?;
@@ -380,7 +392,7 @@ impl X11Client {
         let pointer_device_states =
             current_pointer_device_states(&xcb_connection, &BTreeMap::new()).unwrap_or_default();
 
-        let atoms = XcbAtoms::new(&xcb_connection)
+        let atoms = XcbAtoms::new(&*xcb_connection)
             .context("Failed to get XCB atoms")?
             .reply()
             .context("Failed to get XCB atoms")?;
@@ -455,11 +467,6 @@ impl X11Client {
 
         let clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
 
-        let screen = &xcb_connection.setup().roots[x_root_index];
-        let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
-
-        let xcb_connection = Rc::new(xcb_connection);
-
         let ximc = X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None).ok();
         let xim_handler = if ximc.is_some() {
             Some(XimHandler::new())
@@ -529,6 +536,7 @@ impl X11Client {
             pinch_scale: 1.0,
             gpu_context: Rc::new(RefCell::new(None)),
             compositor_gpu,
+            pending_gpu_context: Some(pending_gpu_context),
             scale_factor,
 
             xkb_context,
@@ -1648,7 +1656,11 @@ impl LinuxClient for X11Client {
         let atoms = state.atoms;
         let scale_factor = state.scale_factor;
         let appearance = state.common.appearance;
-        let compositor_gpu = state.compositor_gpu.take();
+        let gpu = WindowGpu {
+            context: state.gpu_context.clone(),
+            compositor_gpu: state.compositor_gpu.take(),
+            pending: state.pending_gpu_context.take(),
+        };
         let supports_xinput_gestures = state.supports_xinput_gestures;
         let is_bgr = state
             .resource_database
@@ -1658,8 +1670,7 @@ impl LinuxClient for X11Client {
             handle,
             X11ClientStatePtr(Rc::downgrade(&self.0)),
             state.common.foreground_executor.clone(),
-            state.gpu_context.clone(),
-            compositor_gpu,
+            gpu,
             params,
             &xcb_connection,
             client_side_decorations_supported,

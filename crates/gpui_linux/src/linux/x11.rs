@@ -3,6 +3,7 @@ mod clipboard;
 mod display;
 mod event;
 mod frame_loop;
+mod gpu_context;
 mod window;
 mod xim_handler;
 

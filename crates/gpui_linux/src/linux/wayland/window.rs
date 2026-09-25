@@ -30,6 +30,7 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
+use crate::linux::wayland::configure::{Configure, ConfigureThrottle, InProgressConfigure};
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
@@ -85,15 +86,6 @@ impl rwh::HasDisplayHandle for RawWindow {
     }
 }
 
-#[derive(Debug)]
-struct InProgressConfigure {
-    size: Option<Size<Pixels>>,
-    fullscreen: bool,
-    maximized: bool,
-    resizing: bool,
-    tiling: Tiling,
-}
-
 pub struct WaylandWindowState {
     surface_state: WaylandSurfaceState,
     parent: Option<WaylandWindowStatePtr>,
@@ -126,7 +118,7 @@ pub struct WaylandWindowState {
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
     in_progress_configure: Option<InProgressConfigure>,
-    resize_throttle: bool,
+    configure_throttle: ConfigureThrottle,
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
@@ -616,7 +608,7 @@ impl WaylandWindowState {
             tiling: Tiling::default(),
             window_bounds: options.bounds,
             in_progress_configure: None,
-            resize_throttle: false,
+            configure_throttle: ConfigureThrottle::default(),
             client,
             appearance,
             handle,
@@ -918,8 +910,14 @@ impl WaylandWindowStatePtr {
 
     pub fn frame(&self) {
         self.frame_loop.set(FrameLoop::Ticking);
-        let mut state = self.state.borrow_mut();
-        state.resize_throttle = false;
+        let waiting = self.state.borrow_mut().configure_throttle.frame();
+        // Applied before the frame renders, so the frame draws the latest size
+        // and its commit carries the ack.
+        if let Some(configure) = waiting {
+            self.apply_configure(configure);
+            self.state.borrow_mut().redraw_requested = true;
+        }
+        let state = self.state.borrow();
         // GPUI may throttle this tick without calling draw, so leave the request
         // latched until a draw actually reaches the renderer.
         let force_render = state.redraw_requested;
@@ -1070,66 +1068,69 @@ impl WaylandWindowStatePtr {
                     }
                 }
             }
-            {
-                let mut state = self.state.borrow_mut();
-
-                if let Some(mut configure) = state.in_progress_configure.take() {
-                    let got_unmaximized = state.maximized && !configure.maximized;
-                    state.fullscreen = configure.fullscreen;
-                    state.maximized = configure.maximized;
-                    state.tiling = configure.tiling;
-                    // Limit interactive resizes to once per vblank
-                    if configure.resizing && state.resize_throttle {
-                        state.surface_state.ack_configure(serial);
-                        return;
-                    } else if configure.resizing {
-                        state.resize_throttle = true;
-                    }
-                    if !configure.fullscreen && !configure.maximized {
-                        configure.size = if got_unmaximized {
-                            Some(state.window_bounds.size)
-                        } else {
-                            compute_outer_size(state.inset(), configure.size, state.tiling)
-                        };
-                        if let Some(size) = configure.size {
-                            state.window_bounds = Bounds {
-                                origin: Point::default(),
-                                size,
-                            };
-                        }
-                    }
-                    drop(state);
-                    if let Some(size) = configure.size {
-                        self.resize(size);
-                    }
-                }
-            }
-            let state = self.state.borrow_mut();
-            state.surface_state.ack_configure(serial);
-
-            let window_geometry = inset_by_tiling(
-                state.bounds.map_origin(|_| px(0.0)),
-                state.inset(),
-                state.tiling,
-            )
-            .map(|v| f32::from(v) as i32)
-            .map_size(|v| if v <= 0 { 1 } else { v });
-
-            state.surface_state.set_geometry(
-                window_geometry.origin.x,
-                window_geometry.origin.y,
-                window_geometry.size.width,
-                window_geometry.size.height,
-            );
-
-            let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
+            let mut state = self.state.borrow_mut();
+            let toplevel = state.in_progress_configure.take();
+            let Some(configure) = state.configure_throttle.receive(toplevel, serial) else {
+                // Interactive resizes apply once per frame. The next frame
+                // applies and acks this configure.
+                drop(state);
+                self.schedule_frame();
+                return;
+            };
             drop(state);
-            if initial_configure {
+            self.apply_configure(configure);
+            if self.frame_loop.get() == FrameLoop::Unconfigured {
                 self.frame();
             } else {
                 self.request_redraw();
             }
         }
+    }
+
+    /// Applies the toplevel state of `configure`, if any came with it, and
+    /// acks its serial.
+    fn apply_configure(&self, configure: Configure) {
+        if let Some(mut toplevel) = configure.toplevel {
+            let mut state = self.state.borrow_mut();
+            let got_unmaximized = state.maximized && !toplevel.maximized;
+            state.fullscreen = toplevel.fullscreen;
+            state.maximized = toplevel.maximized;
+            state.tiling = toplevel.tiling;
+            if !toplevel.fullscreen && !toplevel.maximized {
+                toplevel.size = if got_unmaximized {
+                    Some(state.window_bounds.size)
+                } else {
+                    compute_outer_size(state.inset(), toplevel.size, state.tiling)
+                };
+                if let Some(size) = toplevel.size {
+                    state.window_bounds = Bounds {
+                        origin: Point::default(),
+                        size,
+                    };
+                }
+            }
+            drop(state);
+            if let Some(size) = toplevel.size {
+                self.resize(size);
+            }
+        }
+        let state = self.state.borrow();
+        state.surface_state.ack_configure(configure.serial);
+
+        let window_geometry = inset_by_tiling(
+            state.bounds.map_origin(|_| px(0.0)),
+            state.inset(),
+            state.tiling,
+        )
+        .map(|v| f32::from(v) as i32)
+        .map_size(|v| if v <= 0 { 1 } else { v });
+
+        state.surface_state.set_geometry(
+            window_geometry.origin.x,
+            window_geometry.origin.y,
+            window_geometry.size.width,
+            window_geometry.size.height,
+        );
     }
 
     pub fn handle_toplevel_decoration_event(&self, event: zxdg_toplevel_decoration_v1::Event) {

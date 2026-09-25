@@ -9,7 +9,7 @@ use gpui::{
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -32,7 +32,9 @@ use std::{
     cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
-use super::{FrameLoop, X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
+use super::{
+    FrameLoop, X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES, gpu_context::WindowGpu,
+};
 
 mod placement;
 pub(crate) use placement::xi_root_position;
@@ -455,8 +457,7 @@ impl X11WindowState {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: gpui_wgpu::GpuContext,
-        compositor_gpu: Option<CompositorGpuHint>,
+        gpu: WindowGpu,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -767,7 +768,7 @@ impl X11WindowState {
                     transparent,
                     preferred_present_mode: None,
                 };
-                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+                gpu.renderer(&raw_window, config)?
             };
 
             renderer.set_subpixel_layout(is_bgr);
@@ -933,8 +934,7 @@ impl X11Window {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: gpui_wgpu::GpuContext,
-        compositor_gpu: Option<CompositorGpuHint>,
+        gpu: WindowGpu,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -954,8 +954,7 @@ impl X11Window {
                 handle,
                 client,
                 executor,
-                gpu_context,
-                compositor_gpu,
+                gpu,
                 params,
                 xcb,
                 client_side_decorations_supported,
