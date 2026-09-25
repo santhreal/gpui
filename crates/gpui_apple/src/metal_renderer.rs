@@ -674,7 +674,7 @@ impl MetalRenderer {
             Some(self.layers.backdrop_targets(&self.device, viewport_size)?)
         };
         let frame: &metal::TextureRef = match &backdrop_targets {
-            Some(targets) => &*targets.frame,
+            Some(targets) => &targets.frame,
             None => texture,
         };
         // Open path clips, innermost last, each with the layer its subtree
@@ -1343,7 +1343,7 @@ fn current_target<'a>(
     clip_stack: &'a [(Path<ScaledPixels>, metal::Texture)],
 ) -> &'a metal::TextureRef {
     match clip_stack.last() {
-        Some((_, layer)) => &**layer,
+        Some((_, layer)) => layer,
         None => frame,
     }
 }
