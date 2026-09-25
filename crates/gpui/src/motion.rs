@@ -12,7 +12,9 @@
 //!   [`App::reduce_motion`](crate::App::reduce_motion) reads its reduced flag.
 //! - [`MotionDriver`], [`MotionFrame`], and [`Advance`]: frame driving for a
 //!   view. The view requests the next animation frame while one of its motion
-//!   values moves and requests none once every value is at rest.
+//!   values moves and requests none once every value is at rest. A value
+//!   tracked with [`MotionFrame::track_within`] scopes that frame to the
+//!   bounds it repaints.
 //!
 //! # Example
 //!

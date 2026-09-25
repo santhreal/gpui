@@ -2,17 +2,21 @@
 //!
 //! WHY: closes the classes "a view keeps requesting animation frames once its
 //! motion is at rest", "a moving value stops receiving frames before it
-//! arrives", and "the app motion policy does not reach a view's motion".
-//! Every motion role is enumerated from [`MotionRole::ALL`] and driven through
-//! both an [`Animator`] and an [`AnimatorRegistry`], beside a [`TweenStore`]
-//! and a [`FrameSpring`], so a new role is covered without editing this file.
-//! Not caught: a new [`Advance`] implementor that no [`Kind`] drives, and
-//! frames requested by elements other than the driver.
+//! arrives", "a value tracked within bounds repaints outside them", and "the
+//! app motion policy does not reach a view's motion". Every motion role is
+//! enumerated from [`MotionRole::ALL`] and driven through both an [`Animator`]
+//! and an [`AnimatorRegistry`], beside a [`TweenStore`] and a [`FrameSpring`],
+//! so a new role is covered without editing this file. Not caught: a new
+//! [`Advance`] implementor that no [`Kind`] drives, frames requested by
+//! elements other than the driver, and damage the view's own elements declare.
 
 use std::time::Duration;
 
 use super::*;
-use crate::{Context, IntoElement, Render, TestAppContext, Window, WindowHandle, div, px, size};
+use crate::{
+    Bounds, Context, IntoElement, Pixels, Render, TestAppContext, Window, WindowHandle, div, point,
+    px, size,
+};
 
 /// Clock time between simulated frames.
 const FRAME: Duration = Duration::from_millis(16);
@@ -60,12 +64,23 @@ impl Kind {
             ResolvedMotion::Spring(_) => None,
         }
     }
+
+    /// Whether the kind moves through [`MotionFrame::track`], and so also
+    /// through [`MotionFrame::track_within`]. The frame spring steps through
+    /// [`MotionFrame::step_spring`], which has no bounded form.
+    fn is_tracked(self) -> bool {
+        match self {
+            Self::Animator(_) | Self::Registry(_) | Self::Tweens => true,
+            Self::Spring => false,
+        }
+    }
 }
 
 /// A view that moves one value of `kind` from 0 to [`TARGET`] through a
-/// [`MotionDriver`].
+/// [`MotionDriver`], tracked within `within` when it is set.
 struct MotionView {
     kind: Kind,
+    within: Option<Bounds<Pixels>>,
     start: bool,
     renders: usize,
     driver: MotionDriver,
@@ -79,9 +94,10 @@ struct MotionView {
 }
 
 impl MotionView {
-    fn new(kind: Kind) -> Self {
+    fn new(kind: Kind, within: Option<Bounds<Pixels>>) -> Self {
         Self {
             kind,
+            within,
             start: false,
             renders: 0,
             driver: MotionDriver::default(),
@@ -122,11 +138,11 @@ impl Render for MotionView {
         }
         self.value = match self.kind {
             Kind::Animator(_) => {
-                frame.track(&mut self.animator);
+                track(&mut frame, &mut self.animator, self.within);
                 self.animator.value()
             }
             Kind::Registry(_) => {
-                frame.track(&mut self.registry);
+                track(&mut frame, &mut self.registry, self.within);
                 self.registry.get(&KEY).map_or(0.0, Animator::value)
             }
             Kind::Tweens => {
@@ -138,7 +154,7 @@ impl Render for MotionView {
                     frame.policy(),
                     frame.now(),
                 );
-                frame.track(&mut self.tweens);
+                track(&mut frame, &mut self.tweens, self.within);
                 value
             }
             Kind::Spring => frame.step_spring(&mut self.spring, self.spring_target),
@@ -148,11 +164,24 @@ impl Render for MotionView {
     }
 }
 
+/// Brings `motion` to `frame`, within `within` when it is set.
+fn track(frame: &mut MotionFrame, motion: &mut impl Advance, within: Option<Bounds<Pixels>>) {
+    match within {
+        Some(bounds) => {
+            frame.track_within(motion, bounds);
+        }
+        None => frame.track(motion),
+    }
+}
+
 /// What a view did while its motion ran to rest and then idled.
 #[derive(Debug)]
 struct Outcome {
     /// Frames the view requested while moving.
     requested: usize,
+    /// The damage of each frame drawn while moving, `None` for a frame that
+    /// repainted the whole viewport.
+    damage: Vec<Option<Bounds<Pixels>>>,
     /// Clock time from the start of the motion to the first render at rest.
     settled_at: Duration,
     /// The value at the first render at rest.
@@ -173,13 +202,18 @@ fn simulate_next_frame(window: &WindowHandle<MotionView>, cx: &mut TestAppContex
     requested
 }
 
-/// Opens a view of `kind` under `policy`, starts its motion, and steps frames
-/// of [`FRAME`] until the view stops requesting them. Then renders the view
-/// [`IDLE_FRAMES`] more times at rest.
-fn run(kind: Kind, policy: MotionPolicy, cx: &mut TestAppContext) -> Result<Outcome, String> {
+/// Opens a view of `kind` tracked within `within` under `policy`, starts its
+/// motion, and steps frames of [`FRAME`] until the view stops requesting them.
+/// Then renders the view [`IDLE_FRAMES`] more times at rest.
+fn run(
+    kind: Kind,
+    policy: MotionPolicy,
+    within: Option<Bounds<Pixels>>,
+    cx: &mut TestAppContext,
+) -> Result<Outcome, String> {
     cx.update(|cx| cx.set_motion_policy(policy));
     let window = cx.open_window(size(px(100.0), px(100.0)), move |_, _| {
-        MotionView::new(kind)
+        MotionView::new(kind, within)
     });
     cx.run_until_parked();
     window
@@ -191,6 +225,7 @@ fn run(kind: Kind, policy: MotionPolicy, cx: &mut TestAppContext) -> Result<Outc
     cx.run_until_parked();
 
     let mut requested = 0;
+    let mut damage = Vec::new();
     let mut settled_at = None;
     for frame in 0..MAX_FRAMES {
         cx.executor().advance_clock(FRAME);
@@ -200,6 +235,11 @@ fn run(kind: Kind, policy: MotionPolicy, cx: &mut TestAppContext) -> Result<Outc
             break;
         }
         requested += pending;
+        damage.push(
+            window
+                .update(cx, |_, window, _| window.last_frame_damage())
+                .unwrap(),
+        );
     }
     let value = window.update(cx, |view, _, _| view.value).unwrap();
 
@@ -221,6 +261,7 @@ fn run(kind: Kind, policy: MotionPolicy, cx: &mut TestAppContext) -> Result<Outc
     })?;
     Ok(Outcome {
         requested,
+        damage,
         settled_at,
         value,
         idle_requests,
@@ -249,11 +290,37 @@ fn check_rest(kind: Kind, outcome: &Outcome, failures: &mut Vec<String>) {
 fn every_kind_requests_frames_while_moving_and_none_at_rest(cx: &mut TestAppContext) {
     let mut failures = Vec::new();
     for kind in Kind::all() {
-        match run(kind, MotionPolicy::DEFAULT, cx) {
+        match run(kind, MotionPolicy::DEFAULT, None, cx) {
             Err(failure) => failures.push(failure),
             Ok(outcome) => {
                 if outcome.requested == 0 {
                     failures.push(format!("{kind:?} requested no frame while moving"));
+                }
+                check_rest(kind, &outcome, &mut failures);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[gpui::test]
+fn a_value_tracked_within_bounds_repaints_only_those_bounds_and_nothing_at_rest(
+    cx: &mut TestAppContext,
+) {
+    let within = Bounds::new(point(px(10.0), px(20.0)), size(px(30.0), px(40.0)));
+    let mut failures = Vec::new();
+    for kind in Kind::all().filter(|kind| kind.is_tracked()) {
+        match run(kind, MotionPolicy::DEFAULT, Some(within), cx) {
+            Err(failure) => failures.push(failure),
+            Ok(outcome) => {
+                if outcome.requested == 0 {
+                    failures.push(format!("{kind:?} requested no frame while moving"));
+                }
+                if let Some(frame) = outcome.damage.iter().position(|&d| d != Some(within)) {
+                    failures.push(format!(
+                        "{kind:?} frame {frame} repainted {:?}, not {within:?}",
+                        outcome.damage[frame]
+                    ));
                 }
                 check_rest(kind, &outcome, &mut failures);
             }
@@ -270,7 +337,7 @@ fn reduced_motion_settles_every_kind_within_its_reduced_span(cx: &mut TestAppCon
             failures.push(format!("{kind:?} has no fixed span under reduced motion"));
             continue;
         };
-        match run(kind, MotionPolicy::REDUCED, cx) {
+        match run(kind, MotionPolicy::REDUCED, None, cx) {
             Err(failure) => failures.push(failure),
             Ok(outcome) => {
                 // The first render at or past the span comes to rest; a
@@ -296,8 +363,8 @@ fn duration_scale_stretches_every_kind(cx: &mut TestAppContext) {
     let mut failures = Vec::new();
     for kind in Kind::all() {
         let (authored, slow) = match (
-            run(kind, MotionPolicy::DEFAULT, cx),
-            run(kind, slow_policy, cx),
+            run(kind, MotionPolicy::DEFAULT, None, cx),
+            run(kind, slow_policy, None, cx),
         ) {
             (Ok(authored), Ok(slow)) => (authored, slow),
             (authored, slow) => {
@@ -323,7 +390,7 @@ fn duration_scale_stretches_every_kind(cx: &mut TestAppContext) {
 #[gpui::test]
 fn reduced_motion_is_the_reduced_flag_of_the_app_motion_policy(cx: &mut TestAppContext) {
     let window = cx.open_window(size(px(100.0), px(100.0)), |_, _| {
-        MotionView::new(Kind::Tweens)
+        MotionView::new(Kind::Tweens, None)
     });
     cx.run_until_parked();
     let renders = |cx: &mut TestAppContext| window.update(cx, |view, _, _| view.renders).unwrap();

@@ -1,12 +1,13 @@
 //! Frame driving for views: a frame is requested while a motion value moves
-//! and none once every value is at rest.
+//! and none once every value is at rest. A value tracked within bounds scopes
+//! the frame it needs to those bounds.
 
 use std::hash::{BuildHasher, Hash};
 
 use super::{
     Animator, AnimatorRegistry, FrameInstant, FrameSpring, MotionPolicy, Timestamp as _, TweenStore,
 };
-use crate::{App, Window};
+use crate::{App, Bounds, Pixels, Window};
 
 /// Motion state that a [`MotionFrame`] brings to its instant.
 pub trait Advance {
@@ -44,7 +45,8 @@ impl<K: Hash + Eq, S: BuildHasher + Default> Advance for TweenStore<K, FrameInst
 /// [`Self::begin`], runs every motion value of the view through the frame, and
 /// ends it with [`Self::end`]. The driver requests the next animation frame for
 /// the view while a value is still moving and requests none once every value
-/// is at rest.
+/// is at rest. A frame whose moving values were all tracked within bounds
+/// repaints only those bounds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MotionDriver {
     previous: Option<FrameInstant>,
@@ -64,31 +66,46 @@ impl MotionDriver {
             delta_seconds,
             policy: cx.motion_policy(),
             moving: false,
+            damage: None,
         }
     }
 
-    /// Ends `frame`. When a value the frame advanced is still moving, requests
-    /// the next animation frame for the view that is rendering, and returns
-    /// `true`. Otherwise requests nothing and returns `false`.
-    pub fn end(&mut self, frame: MotionFrame, window: &Window) -> bool {
+    /// Ends `frame` and returns whether a value the frame advanced is still
+    /// moving.
+    ///
+    /// A moving value tracked with [`MotionFrame::track`] requests the next
+    /// animation frame for the view that is rendering, which repaints the view.
+    /// Otherwise, moving values tracked with [`MotionFrame::track_within`]
+    /// declare the union of their bounds as damage and request the next
+    /// animation frame scoped to the damage declared at paint, as
+    /// [`Window::request_animation_frame_at_paint`] describes. With no value
+    /// moving, requests nothing.
+    pub fn end(&mut self, frame: MotionFrame, window: &mut Window) -> bool {
         if frame.moving {
             window.request_animation_frame();
-        } else {
-            self.previous = None;
+            return true;
         }
-        frame.moving
+        let Some(damage) = frame.damage else {
+            self.previous = None;
+            return false;
+        };
+        window.declare_damage(damage);
+        window.request_animation_frame_at_paint();
+        true
     }
 }
 
 /// One frame of a view's motion: the instant every value samples, the time
-/// since the view's previous moving frame, the motion policy, and whether a
-/// value is still moving. Created by [`MotionDriver::begin`].
+/// since the view's previous moving frame, the motion policy, whether a value
+/// is still moving, and the bounds of the moving values tracked within bounds.
+/// Created by [`MotionDriver::begin`].
 #[derive(Clone, Copy, Debug)]
 pub struct MotionFrame {
     now: FrameInstant,
     delta_seconds: f32,
     policy: MotionPolicy,
     moving: bool,
+    damage: Option<Bounds<Pixels>>,
 }
 
 impl MotionFrame {
@@ -112,6 +129,17 @@ impl MotionFrame {
     pub fn track(&mut self, motion: &mut impl Advance) {
         let moving = motion.advance(self);
         self.moving |= moving;
+    }
+
+    /// Brings `motion` to this frame. While it is still moving, records
+    /// `bounds`, in window coordinates, as the region its next frame changes.
+    /// Returns whether it is still moving.
+    pub fn track_within(&mut self, motion: &mut impl Advance, bounds: Bounds<Pixels>) -> bool {
+        let moving = motion.advance(self);
+        if moving {
+            self.damage = Some(self.damage.map_or(bounds, |damage| damage.union(&bounds)));
+        }
+        moving
     }
 
     /// Steps `spring` toward `target` by [`Self::delta_seconds`] converted to
