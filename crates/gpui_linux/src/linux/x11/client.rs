@@ -199,6 +199,8 @@ pub struct X11ClientState {
     xkb_device_id: i32,
     client_side_decorations_supported: bool,
     compositor_present: bool,
+    /// Whether an EWMH window manager ran when the client connected.
+    window_manager_present: bool,
     pub(crate) x_root_index: usize,
     pub(crate) resource_database: Database,
     pub(crate) atoms: XcbAtoms,
@@ -261,6 +263,13 @@ impl X11ClientStatePtr {
             state.cursor_hidden_window = None;
         }
         state.cursor_styles.remove(&x_window);
+    }
+
+    /// Whether an EWMH window manager ran when the client connected;
+    /// false once the client is gone.
+    pub fn window_manager_present(&self) -> bool {
+        self.get_client()
+            .is_some_and(|client| client.0.borrow().window_manager_present)
     }
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
@@ -402,10 +411,12 @@ impl X11Client {
         let gtk_frame_extents_supported =
             check_gtk_frame_extents_supported(&xcb_connection, &atoms, root);
         let client_side_decorations_supported = compositor_present && gtk_frame_extents_supported;
+        let window_manager_present = check_window_manager_present(&xcb_connection, &atoms, root);
         log::info!(
-            "x11: compositor present: {}, gtk_frame_extents_supported: {}",
+            "x11: compositor present: {}, gtk_frame_extents_supported: {}, window manager present: {}",
             compositor_present,
-            gtk_frame_extents_supported
+            gtk_frame_extents_supported,
+            window_manager_present
         );
 
         let xkb = get_reply(
@@ -544,6 +555,7 @@ impl X11Client {
             xkb_device_id,
             client_side_decorations_supported,
             compositor_present,
+            window_manager_present,
             x_root_index,
             resource_database,
             atoms,
@@ -2231,6 +2243,33 @@ fn check_compositor_present(xcb_connection: &XCBConnection, root: xproto::Window
     );
 
     method1 || method2 || method3
+}
+
+/// Whether an EWMH window manager runs on the screen of `root`: the
+/// root's _NET_SUPPORTING_WM_CHECK is a window whose own
+/// _NET_SUPPORTING_WM_CHECK is itself. The root property outlives a
+/// window manager that exits; its check window does not.
+fn check_window_manager_present(
+    xcb_connection: &XCBConnection,
+    atoms: &XcbAtoms,
+    root: xproto::Window,
+) -> bool {
+    let check_window = |window| {
+        get_reply(
+            || "Failed to get _NET_SUPPORTING_WM_CHECK",
+            xcb_connection.get_property(
+                false,
+                window,
+                atoms._NET_SUPPORTING_WM_CHECK,
+                xproto::AtomEnum::WINDOW,
+                0,
+                1,
+            ),
+        )
+        .log_with_level(Level::Debug)
+        .and_then(|reply| reply.value32()?.next())
+    };
+    check_window(root).is_some_and(|wm| check_window(wm) == Some(wm))
 }
 
 fn check_gtk_frame_extents_supported(

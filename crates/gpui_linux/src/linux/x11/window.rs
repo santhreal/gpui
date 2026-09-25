@@ -84,6 +84,7 @@ x11rb::atom_manager! {
         _NET_WM_STATE_MODAL,
         _NET_WM_SYNC,
         _NET_SUPPORTED,
+        _NET_SUPPORTING_WM_CHECK,
         _MOTIF_WM_HINTS,
         _GTK_SHOW_WINDOW_MENU,
         _GTK_FRAME_EXTENTS,
@@ -1542,23 +1543,46 @@ impl PlatformWindow for X11Window {
         None
     }
 
+    /// With an EWMH window manager running, a _NET_ACTIVE_WINDOW request,
+    /// so the window manager applies its focus policy. With none, nothing
+    /// handles that request: the window raises itself and takes the input
+    /// focus.
     fn activate(&self) {
-        let data = [1, xproto::Time::CURRENT_TIME.into(), 0, 0, 0];
-        let message = xproto::ClientMessageEvent::new(
-            32,
-            self.0.x_window,
-            self.0.state.borrow().atoms._NET_ACTIVE_WINDOW,
-            data,
+        let state = self.0.state.borrow();
+        let (client, root, active) = (
+            state.client.clone(),
+            state.x_root_window,
+            state.atoms._NET_ACTIVE_WINDOW,
         );
-        self.0
-            .xcb
-            .send_event(
-                false,
-                self.0.state.borrow().x_root_window,
-                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
-                message,
-            )
-            .log_err();
+        drop(state);
+        if client.window_manager_present() {
+            let data = [1, xproto::Time::CURRENT_TIME.into(), 0, 0, 0];
+            let message = xproto::ClientMessageEvent::new(32, self.0.x_window, active, data);
+            self.0
+                .xcb
+                .send_event(
+                    false,
+                    root,
+                    xproto::EventMask::SUBSTRUCTURE_REDIRECT
+                        | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                    message,
+                )
+                .log_err();
+        } else {
+            let above = xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE);
+            self.0
+                .xcb
+                .configure_window(self.0.x_window, &above)
+                .log_err();
+            self.0
+                .xcb
+                .set_input_focus(
+                    xproto::InputFocus::POINTER_ROOT,
+                    self.0.x_window,
+                    xproto::Time::CURRENT_TIME,
+                )
+                .log_err();
+        }
         xcb_flush(&self.0.xcb);
     }
 
