@@ -2392,6 +2392,17 @@ impl Window {
         style
     }
 
+    /// The color of the current text style, as `text_style().color` returns
+    /// it without composing the rest of the style: the color of the innermost
+    /// `with_text_style` refinement that sets one, else the default text color.
+    pub fn text_color(&self) -> Hsla {
+        self.text_style_stack
+            .iter()
+            .rev()
+            .find_map(|refinement| refinement.color)
+            .unwrap_or_else(|| TextStyle::default().color)
+    }
+
     /// Check if the platform window is maximized.
     ///
     /// On some platforms (namely Windows) this is different than the bounds being the size of the display
